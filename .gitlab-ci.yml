@@ -17,6 +17,18 @@ stages:
   - test
   - deploy
 
+# Scheduled pipelines (the nightly run on main) run only serializability_nightly
+# and dependency_audit; every other job extends this template to stay out of
+# them. A job that needs its own `rules` cannot use this template (its rules
+# would replace the template's); it starts its rules with the `schedule ...
+# when: never` rule instead, as `docs_build` and `pages` do.
+# system/tests/test_ci_config.py fails for a job that does neither.
+.not_in_scheduled_pipelines:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'schedule'
+      when: never
+    - when: on_success
+
 # Shared build steps for the API documentation. Both the merge-request check
 # (docs_build) and the publish job (pages) run exactly the same build, so the
 # check validates precisely what would be published. sphinx-apidoc regenerates
@@ -45,6 +57,7 @@ stages:
 # (system/tests/test_readme_notebooks.py) checks its notebook table.
 detect-docs-only:
   stage: prepare
+  extends: .not_in_scheduled_pipelines
   tags:
     - test
   # Full history so the diff against the target branch can be computed.
@@ -74,6 +87,7 @@ detect-docs-only:
 
 formatting:
   stage: test
+  extends: .not_in_scheduled_pipelines
   tags:
     - test
   script:
@@ -96,6 +110,7 @@ formatting:
 # to the command in CONTRIBUTING.md and in the dependency_audit job below.
 binder_requirements:
   stage: test
+  extends: .not_in_scheduled_pipelines
   tags:
     - test
   script:
@@ -129,7 +144,8 @@ binder_requirements:
 # append `--ignore-vuln <ID>` to the pip-audit command and put a YAML comment
 # above it giving the reason and the date; remove it once a fixed version
 # exists. How to fix a finding: CONTRIBUTING.md, section Dependencies >
-# Security audit.
+# Security audit. Runs in the nightly scheduled pipeline as well, so new
+# advisories are reported without a commit.
 dependency_audit:
   stage: test
   tags:
@@ -250,6 +266,12 @@ gitleaks_secret_detection:
       - gitleaks-report.json
     expire_in: 1 week
   rules:
+    # A scheduled pipeline never matches the merge-request rule below, so this
+    # rule changes nothing; it keeps the rules of all jobs alike (see
+    # .not_in_scheduled_pipelines), and system/tests/test_ci_config.py requires
+    # it:
+    - if: $CI_PIPELINE_SOURCE == 'schedule'
+      when: never
     # Only in merge requests: the scan needs a target branch.
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
   interruptible: true
@@ -403,12 +425,19 @@ semgrep_sast:
       sast: gl-sast-report.json
     expire_in: 1 week
   rules:
+    # A scheduled pipeline never matches the merge-request rule below, so this
+    # rule changes nothing; it keeps the rules of all jobs alike (see
+    # .not_in_scheduled_pipelines), and system/tests/test_ci_config.py requires
+    # it:
+    - if: $CI_PIPELINE_SOURCE == 'schedule'
+      when: never
     # Only in merge requests: the scan needs a target branch.
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
   interruptible: true
 
 py_test:
   stage: test
+  extends: .not_in_scheduled_pipelines
   tags:
     - test
   script:
@@ -438,8 +467,55 @@ py_test:
       - htmlcov/*
 
 
+# Runs the larger schedule spaces of the serializability test of the MVCC store
+# (system/tests/test_mvcc_serializability.py, NightlySerializabilityTest: three
+# transactions, voluntary aborts, longer transactions) and the two-transaction
+# validation tests under further hash seeds. This takes about two hours and is
+# too slow for every merge request. It runs in the nightly scheduled pipeline on
+# main; in a merge request it can be started by hand and does not block the
+# merge. No coverage: it would make the run several times slower, and the code
+# it runs is already covered by py_test. The job fails if all tests were
+# skipped, e.g. because EXPLAINDB_NIGHTLY did not reach them.
+serializability_nightly:
+  stage: test
+  tags:
+    - test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'schedule'
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: manual
+      allow_failure: true
+  variables:
+    EXPLAINDB_NIGHTLY: "1"
+  timeout: 4h
+  script:
+    - uv sync --frozen
+    # Show the output while the tests run (tee) and keep their exit status: the
+    # braced group ends with `echo`, so its own exit status is always 0, and the
+    # status of the tests is written to a file instead; `|| status=$?` keeps a
+    # failing test run from ending the job before the status is written.
+    - |
+      { status=0; uv run python -m unittest -v system.tests.test_mvcc_serializability.NightlySerializabilityTest || status=$?; echo "$status" > nightly.status; } 2>&1 | tee nightly.log
+      if [ "$(cat nightly.status)" != "0" ]; then exit 1; fi
+      # unittest ends with "Ran N tests in ..." and, if tests were skipped,
+      # "(skipped=M)"; fail if every test was skipped:
+      ran=$(sed -n 's/^Ran \([0-9]*\) tests\{0,1\} in .*/\1/p' nightly.log | tail -n 1)
+      skipped=$(sed -n 's/.*skipped=\([0-9]*\).*/\1/p' nightly.log | tail -n 1)
+      if [ -z "$ran" ] || [ "$ran" -eq "${skipped:-0}" ]; then echo "All nightly tests were skipped; is EXPLAINDB_NIGHTLY set?"; exit 1; fi
+    # The two-transaction validation tests under further hash seeds: the store
+    # iterates over sets of object ids, whose order Python picks at random per
+    # process (hash seed); a bug may show only under some orders.
+    - |
+      for seed in 1 2 3; do
+        PYTHONHASHSEED=$seed uv run python -m unittest \
+          system.tests.test_mvcc_serializability.SerializabilityTest.test_validation_method_1_brute_force \
+          system.tests.test_mvcc_serializability.SerializabilityTest.test_validation_method_2_write_sets || exit 1
+      done
+  interruptible: true
+
 ipynb_test:
   stage: test
+  extends: .not_in_scheduled_pipelines
   tags:
     - test
   # Run the notebooks in parallel across several jobs to cut wall-clock time.
@@ -474,6 +550,7 @@ ipynb_test:
 
 stats_and_linting:
   stage: test
+  extends: .not_in_scheduled_pipelines
   tags:
     - test
   script:
@@ -505,6 +582,12 @@ docs_build:
   tags:
     - test
   rules:
+    # A scheduled pipeline never matches the merge-request rule below, so this
+    # rule changes nothing; it keeps the rules of all jobs alike (see
+    # .not_in_scheduled_pipelines), and system/tests/test_ci_config.py requires
+    # it:
+    - if: $CI_PIPELINE_SOURCE == 'schedule'
+      when: never
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
   script:
     # Skip when the merge request only changes Markdown (see detect-docs-only);
@@ -523,6 +606,10 @@ pages:
   tags:
     - test
   rules:
+    # Not in the nightly scheduled pipeline on main, which would otherwise
+    # publish the pages again (see .not_in_scheduled_pipelines):
+    - if: $CI_PIPELINE_SOURCE == 'schedule'
+      when: never
     - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
   script:
     - !reference [.build_docs, script]

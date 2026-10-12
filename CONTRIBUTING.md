@@ -155,6 +155,25 @@ The notebooks live in `notebooks/`. When you add, rename or remove one, also upd
   jobs) and the expected packing and notebook count in
   `system/tests/test_assign_notebooks.py`, which fails otherwise.
 
+## Serializability test of the MVCC store
+
+`system/tests/test_mvcc_serializability.py` runs every schedule of a *schedule space*: a set of
+schedules given by the initial state, the data operations, how many of them each transaction runs,
+and how the transactions end. The regular test job runs every schedule of two short transactions
+(one or two data operations each).
+
+The larger spaces (three transactions, voluntary aborts, longer transactions) take about half an
+hour locally (about two hours on CI). They run in the job `serializability_nightly` of the nightly
+scheduled pipeline on main; in a merge request the job can be started by hand. Only this job and
+`dependency_audit` run in scheduled pipelines: every new CI job must extend
+`.not_in_scheduled_pipelines` (or start its own rules with the same `schedule`/`never` rule), which
+`system/tests/test_ci_config.py` checks. A job meant for scheduled pipelines is added to `SCHEDULED_JOBS`
+in that test instead. To run the larger spaces locally:
+
+```sh
+EXPLAINDB_NIGHTLY=1 uv run python -m unittest -v system.tests.test_mvcc_serializability.NightlySerializabilityTest
+```
+
 ## API documentation
 
 An HTML API reference is generated from the source docstrings with

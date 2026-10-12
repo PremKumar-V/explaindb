@@ -21,442 +21,130 @@
 # Test modules use self-documenting method/class names and module-level
 # fixtures, so pylint's naming and docstring checks are relaxed here.
 # pylint: disable=invalid-name,missing-class-docstring,missing-function-docstring
-"""Exhaustive check that the MVCC store only commits serializable schedules of two transactions."""
+"""Exhaustive check that the MVCC store only commits serializable schedules of two or three transactions."""
 
 from __future__ import annotations
 
+import functools
 import itertools
-import math
+import os
 import unittest
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
-from typing import Literal
+from typing import cast
 
-from system.query_processing.predicates import WHERE_Clause
-from system.stores.MVCC import TransactionAbortedException, TransactionalKeyValueStore
-from system.stores.VersionedKeyValueStore import VersionedKeyValueStore
-
-
-@dataclass(frozen=True)
-class Row:
-    """The objects stored in the tests: ``a`` is filtered on, ``b`` only changes the content."""
-
-    a: int
-    b: int
-
-
-@dataclass(frozen=True)
-class Op:
-    """One data operation of a transaction.
-
-    A read returns the objects with ``a == a_equals``, or all objects if ``a_equals`` is None. An update stores
-    ``row`` under ``key``, inserting ``key`` if it does not exist. A delete removes ``key``.
-    """
-
-    kind: Literal["read", "update", "delete"]
-    key: str | None = None
-    row: Row | None = None
-    a_equals: int | None = None
-
-    def __str__(self) -> str:
-        """Shows the operation as in the schedule tables, e.g. ``update x=Row(1,0)``."""
-        if self.kind == "read":
-            return "read all" if self.a_equals is None else f"read a=={self.a_equals}"
-        if self.kind == "update":
-            return f"update {self.key}=Row({self.row.a},{self.row.b})"
-        if self.kind == "delete":
-            return f"delete {self.key}"
-        raise ValueError(f"unknown operation kind {self.kind}")
-
-
-# a step of a transaction's program: begin, commit or a data operation:
-Step = Literal["begin", "commit"] | Op
-
-# a schedule: the steps of both transactions in execution order, each with the index of its transaction
-# (0 is T1, 1 is T2):
-Schedule = list[tuple[int, Step]]
-
-# the result of a read: (object_id, object)-pairs sorted by object_id:
-ReadResult = tuple[tuple[str, Row], ...]
+from system.playground.schedules import (
+    DataOperation,
+    ExecutedDataOperation,
+    Row,
+    Schedule,
+    ScheduleCheck,
+    ScheduleSpace,
+    ScheduledOperation,
+    StoredObject,
+    Transaction,
+    TransactionRecord,
+    all_transactions,
+    check_all_schedules,
+    number_of_schedules,
+    overlapping_committed_writers,
+    schedules,
+    serializability_violation,
+    two_commits_during_writer,
+)
+from system.stores.MVCC import TransactionalKeyValueStore
 
 # the initial state: x is selected by a == 1, z is not, y does not exist yet:
-INITIAL_STATE: dict[str, Row] = {"x": Row(1, 0), "z": Row(0, 0)}
+INITIAL_STATE: tuple[StoredObject, ...] = (
+    StoredObject("x", Row(1, 0)),
+    StoredObject("z", Row(0, 0)),
+)
 
 # one representative per case of the validation (see TransactionalKeyValueStore._validate_transaction): whether
 # a write changes what a read returns depends only on whether the object is selected by a == 1 before and after
 # the write and on whether its content changes.
-# There is no "delete y": deleting an object that was never stored raises KeyError.
-OPERATIONS: list[Op] = [
-    Op("read", a_equals=1),
-    Op("read"),
+# There is no "delete y": deleting an object that was never stored raises KeyError. The nine data operations:
+DATA_OPERATIONS: tuple[DataOperation, ...] = (
+    DataOperation("read", a_equals=1),
+    DataOperation("read"),
     # x stays selected by a == 1, content changes:
-    Op("update", "x", Row(1, 1)),
+    DataOperation("update", "x", Row(1, 1)),
     # x stays selected by a == 1, content unchanged:
-    Op("update", "x", Row(1, 0)),
+    DataOperation("update", "x", Row(1, 0)),
     # x drops out of a == 1:
-    Op("update", "x", Row(0, 0)),
+    DataOperation("update", "x", Row(0, 0)),
     # x drops out of a == 1 by deletion:
-    Op("delete", "x"),
+    DataOperation("delete", "x"),
     # y is inserted into a == 1:
-    Op("update", "y", Row(1, 0)),
+    DataOperation("update", "y", Row(1, 0)),
     # y is inserted outside of a == 1:
-    Op("update", "y", Row(0, 0)),
+    DataOperation("update", "y", Row(0, 0)),
     # z moves into a == 1:
-    Op("update", "z", Row(1, 0)),
-]
-
-# every transaction runs 1 to MAX_OPERATIONS data operations:
-MAX_OPERATIONS: int = 2
+    DataOperation("update", "z", Row(1, 0)),
+)
 
 
-def programs(operations: list[Op], max_operations: int) -> list[list[Step]]:
-    """Returns all programs ``begin, op_1, ..., op_k, commit`` with 1 <= k <= max_operations."""
-    return [
-        ["begin", *ops, "commit"]
-        for k in range(1, max_operations + 1)
-        for ops in itertools.product(operations, repeat=k)
-    ]
+# all schedules of two transactions with one or two of the nine data operations each, run in the regular test job:
+TWO_TRANSACTIONS: ScheduleSpace = ScheduleSpace(
+    INITIAL_STATE, DATA_OPERATIONS, frozenset(itertools.product((1, 2), repeat=2))
+)
 
+# all schedules of three transactions, at most one of them with two data operations, the others with one; run
+# nightly only (see NightlySerializabilityTest). To keep the run short, only six of the nine data operations are
+# used. The other three are tested with two transactions only (TWO_TRANSACTIONS, TWO_TRANSACTIONS_WITH_ABORT):
+# changing the content of x while it stays selected, rewriting x unchanged, and inserting y outside of a == 1:
+THREE_TRANSACTIONS: ScheduleSpace = ScheduleSpace(
+    INITIAL_STATE,
+    (
+        DataOperation("read", a_equals=1),
+        DataOperation("read"),
+        # x drops out of a == 1:
+        DataOperation("update", "x", Row(0, 0)),
+        # x drops out of a == 1 by deletion:
+        DataOperation("delete", "x"),
+        # y is inserted into a == 1:
+        DataOperation("update", "y", Row(1, 0)),
+        # z moves into a == 1:
+        DataOperation("update", "z", Row(1, 0)),
+    ),
+    frozenset({(1, 1, 1), (2, 1, 1), (1, 2, 1), (1, 1, 2)}),
+)
 
-def interleavings(program_1: list[Step], program_2: list[Step]) -> Iterator[Schedule]:
-    """Yields every interleaving of two programs in which the first program begins first.
+# all schedules of three transactions, two of them with two data operations and the third with one; run nightly
+# only. Two transactions can thus both read and write, e.g. a write skew next to a third transaction. Each of the
+# three writes changes what read a == 1 returns. "read all" and "delete x" are left out, as THREE_TRANSACTIONS
+# covers them: with all six data operations the run would be about eight times longer.
+THREE_TRANSACTIONS_TWO_READ_WRITE: ScheduleSpace = ScheduleSpace(
+    INITIAL_STATE,
+    (
+        DataOperation("read", a_equals=1),
+        # x drops out of a == 1:
+        DataOperation("update", "x", Row(0, 0)),
+        # y is inserted into a == 1:
+        DataOperation("update", "y", Row(1, 0)),
+        # z moves into a == 1:
+        DataOperation("update", "z", Row(1, 0)),
+    ),
+    frozenset({(2, 2, 1), (2, 1, 2), (1, 2, 2)}),
+)
 
-    The store numbers transactions in the order of their begin. So an interleaving in which the second program
-    begins first is the same run as the mirrored interleaving with the two programs swapped. That one is enumerated
-    when :func:`schedules` takes the pair of programs the other way round.
-    """
-    n: int = len(program_1) + len(program_2)
-    rest: tuple[int, ...]
-    # the first step (begin) of program_1 is at position 0, its other steps anywhere after it:
-    for rest in itertools.combinations(range(1, n), len(program_1) - 1):
-        positions_1: set[int] = {0, *rest}
-        schedule: Schedule = []
-        next_1: int = 0
-        next_2: int = 0
-        for i in range(n):
-            if i in positions_1:
-                schedule.append((0, program_1[next_1]))
-                next_1 += 1
-            else:
-                schedule.append((1, program_2[next_2]))
-                next_2 += 1
-        yield schedule
+# all schedules of TWO_TRANSACTIONS, but every transaction either commits or aborts on its own; run nightly only.
+# The voluntary abort can come after writes, which the store has to undo:
+TWO_TRANSACTIONS_WITH_ABORT: ScheduleSpace = ScheduleSpace(
+    INITIAL_STATE,
+    DATA_OPERATIONS,
+    TWO_TRANSACTIONS.data_operation_counts,
+    endings=("commit", "abort"),
+)
 
-
-def schedules(operations: list[Op], max_operations: int) -> Iterator[Schedule]:
-    """Yields every schedule of two transactions with 1 to max_operations data operations each."""
-    all_programs: list[list[Step]] = programs(operations, max_operations)
-    for program_1, program_2 in itertools.product(all_programs, repeat=2):
-        yield from interleavings(program_1, program_2)
-
-
-def number_of_schedules(number_of_operations: int, max_operations: int) -> int:
-    """Returns how many schedules :func:`schedules` yields.
-
-    There are number_of_operations ** k programs with k data operations, each with L = k + 2 steps. For each pair
-    of programs, the first program begins at position 0 and its other L_1 - 1 steps take any of the remaining
-    L_1 + L_2 - 1 positions; with L = k + 2 this is comb(k_1 + k_2 + 3, k_1 + 1).
-    """
-    return sum(
-        number_of_operations ** (k_1 + k_2) * math.comb(k_1 + k_2 + 3, k_1 + 1)
-        for k_1 in range(1, max_operations + 1)
-        for k_2 in range(1, max_operations + 1)
-    )
-
-
-@dataclass
-class TransactionRecord:  # pylint: disable=too-many-instance-attributes
-    """What one transaction did in a concurrent run."""
-
-    # the name used in messages and tables, e.g. T1:
-    name: str
-    # the transaction id assigned by the store at begin:
-    TA_id: int | None = None
-    # the executed data operations in program order, each with the observed result for reads:
-    operations: list[tuple[Op, ReadResult | None]] = field(default_factory=list)
-    # True if the transaction committed:
-    committed: bool = False
-    # True if the store aborted the transaction, in a data operation or in its validation phase:
-    aborted: bool = False
-    # True if the store aborted the transaction in its validation phase:
-    aborted_at_commit: bool = False
-    # the commit timestamp assigned by the store, None unless committed:
-    commit_timestamp: int | None = None
-    # the positions of the first and last executed step of this transaction in the schedule:
-    first_position: int | None = None
-    last_position: int | None = None
-
-    @property
-    def wrote(self) -> bool:
-        """True if the transaction executed an update or delete."""
-        return any(op.kind != "read" for op, _ in self.operations)
-
-    @property
-    def serialization_point(self) -> int:
-        """The position of a committed transaction in the equivalent serial order.
-
-        A transaction that wrote is validated against the state at its commit, so it is placed at its commit
-        timestamp. A read-only transaction is not validated; it reads the snapshot of its begin and is placed
-        at its TA_id. Both come from the same counter, so they can be compared.
-        """
-        assert self.committed and self.TA_id is not None
-        assert self.commit_timestamp is not None
-        return self.commit_timestamp if self.wrote else self.TA_id
-
-
-@dataclass
-class ScheduleRun:
-    """The outcome of running one schedule on a store."""
-
-    # what each transaction did, in the order of their transaction index:
-    records: list[TransactionRecord]
-    # the most recent committed version of every object after the run (empty if the run stopped with an error):
-    final_state: dict[str, Row]
-    # one line per step for the schedule table: the transaction index and what happened:
-    log: list[tuple[int, str]]
-    # the exception the store raised other than TransactionAbortedException, None if there was none:
-    error: str | None = None
-
-
-def format_read_result(result: ReadResult) -> str:
-    """Shows a read result compactly, e.g. ``{x=Row(1,0)}``."""
-    return "{" + ", ".join(f"{key}=Row({row.a},{row.b})" for key, row in result) + "}"
-
-
-def evaluate_read(state: dict[str, Row], a_equals: int | None) -> ReadResult:
-    """Returns what a read with ``a == a_equals`` (or without predicate) returns on state."""
-    return tuple(
-        sorted(
-            (
-                (key, row)
-                for key, row in state.items()
-                if a_equals is None or row.a == a_equals
-            ),
-            key=lambda pair: pair[0],
-        )
-    )
-
-
-def committed_state(store: TransactionalKeyValueStore) -> dict[str, Row]:
-    """Returns the most recent committed version of every object, read directly from the store's versions."""
-    state: dict[str, Row] = {}
-    object_id: str
-    entry: VersionedKeyValueStore.KVStoreEntry
-    for object_id, entry in store.key_value_store.items():
-        # an aborted insert leaves an entry without committed versions, a deleted object ends with a delete marker:
-        if entry.committed and isinstance(
-            entry.committed[-1], VersionedKeyValueStore.UpdateEntry
-        ):
-            state[object_id] = entry.committed[-1].value
-    return state
-
-
-def execute_step(
-    store: TransactionalKeyValueStore, record: TransactionRecord, step: Step
-) -> str:
-    """Executes one step of a transaction on store, records it in record, and returns the line for the table.
-
-    Exceptions of the store, including TransactionAbortedException, are passed on to the caller. If the validation
-    phase aborts a commit, record.aborted_at_commit is set before the exception is passed on. Raises RuntimeError
-    if a commit leaves the commit timestamp unset.
-    """
-    if step == "begin":
-        record.TA_id = store.begin_transaction()
-        return f"begin (TA_id {record.TA_id})"
-    if step == "commit":
-        try:
-            store.commit_transaction(record.TA_id)
-        except TransactionAbortedException:
-            record.aborted_at_commit = True
-            raise
-        # commit_transaction does not return the commit timestamp, the transaction dictionary has it:
-        commit_timestamp: int | None = store.TD[record.TA_id].committed_timestamp
-        if commit_timestamp is None:
-            raise RuntimeError("commit left committed_timestamp None")
-        record.commit_timestamp = commit_timestamp
-        record.committed = True
-        return f"commit (timestamp {record.commit_timestamp})"
-    if step.kind == "read":
-        where: WHERE_Clause | None = (
-            None if step.a_equals is None else WHERE_Clause("a", "==", step.a_equals)
-        )
-        result: ReadResult = tuple(
-            sorted(store.read_objects(record.TA_id, where), key=lambda pair: pair[0])
-        )
-        record.operations.append((step, result))
-        return f"{step} -> {format_read_result(result)}"
-    if step.kind == "update":
-        store.update_object(step.key, step.row, record.TA_id)
-    elif step.kind == "delete":
-        store.delete_object(step.key, record.TA_id)
-    else:
-        raise ValueError(f"unknown step {step}")
-    record.operations.append((step, None))
-    return str(step)
-
-
-def run_schedule(store: TransactionalKeyValueStore, schedule: Schedule) -> ScheduleRun:
-    """Runs schedule on store and records what each transaction did.
-
-    A transaction aborted by the store skips its remaining steps. If the store raises any other exception, the run
-    stops and the exception is recorded in error.
-    """
-    records: list[TransactionRecord] = [
-        TransactionRecord(name="T1"),
-        TransactionRecord(name="T2"),
-    ]
-    log: list[tuple[int, str]] = []
-    position: int
-    transaction_index: int
-    step: Step
-    for position, (transaction_index, step) in enumerate(schedule):
-        record: TransactionRecord = records[transaction_index]
-        if record.aborted:
-            log.append((transaction_index, f"({step}: skipped)"))
-            continue
-        if record.first_position is None:
-            record.first_position = position
-        record.last_position = position
-        try:
-            log.append((transaction_index, execute_step(store, record, step)))
-        except TransactionAbortedException:
-            record.aborted = True
-            log.append((transaction_index, f"{step}: aborted"))
-        except Exception as error:  # pylint: disable=broad-exception-caught
-            # any other exception is a bug of the store, it is reported with the schedule table:
-            description: str = f"{step}: raised {type(error).__name__}: {error}"
-            log.append((transaction_index, description))
-            return ScheduleRun(records, {}, log, error=description)
-
-    return ScheduleRun(records, committed_state(store), log)
-
-
-def serial_order(records: list[TransactionRecord]) -> list[TransactionRecord]:
-    """Returns the committed transactions ordered by their serialization points."""
-    return sorted(
-        (record for record in records if record.committed),
-        key=lambda record: record.serialization_point,
-    )
-
-
-def serializability_violation(
-    initial_state: dict[str, Row],
-    records: list[TransactionRecord],
-    final_state: dict[str, Row],
-) -> str | None:
-    """Replays the committed transactions serially and returns a description of the first difference, or None.
-
-    The transactions are replayed one after another in the order of their serialization points. Every read
-    must return what the transaction read in the concurrent run, and the final state must be the same.
-    """
-    state: dict[str, Row] = dict(initial_state)
-    for record in serial_order(records):
-        for op, observed in record.operations:
-            if op.kind == "read":
-                expected: ReadResult = evaluate_read(state, op.a_equals)
-                if observed != expected:
-                    return (
-                        f"{record.name}: {op} returned {format_read_result(observed)}, "
-                        f"in the serial order it returns {format_read_result(expected)}"
-                    )
-            elif op.kind == "update":
-                state[op.key] = op.row
-            elif op.kind == "delete":
-                state.pop(op.key, None)
-            else:
-                raise ValueError(f"unknown operation {op}")
-    if state != final_state:
-        return (
-            f"final state is {format_read_result(evaluate_read(final_state, None))}, "
-            f"in the serial order it is {format_read_result(evaluate_read(state, None))}"
-        )
-    return None
-
-
-def format_schedule(run: ScheduleRun) -> str:
-    """Shows a run as a table with one column per transaction and time pointing down."""
-    # the column width fits the longest line of the first transaction:
-    width: int = 2 + max(
-        [len(text) for transaction_index, text in run.log if transaction_index == 0]
-        + [len(record.name) for record in run.records]
-    )
-    lines: list[str] = [
-        "".join(record.name.ljust(width) for record in run.records).rstrip()
-    ]
-    for transaction_index, text in run.log:
-        lines.append(" " * (width * transaction_index) + text)
-    order: str = ", ".join(
-        f"{record.name} ({'commit' if record.wrote else 'begin'} {record.serialization_point})"
-        for record in serial_order(run.records)
-    )
-    lines.append(f"\nserial order: {order or '(nothing committed)'}")
-    return "\n".join(lines)
-
-
-@dataclass
-class ScheduleCheck:
-    """The result of checking all schedules on one kind of store."""
-
-    # the number of schedules run (all of them unless a violation stopped the check early):
-    schedules_run: int = 0
-    # the number of schedules in which two transactions that both wrote ran concurrently and both committed:
-    concurrent_writers: int = 0
-    # the number of schedules in which the store aborted a transaction in its validation phase:
-    validation_aborts: int = 0
-    # the description of the first violation, including the schedule table; None if there is none:
-    violation: str | None = None
-
-
-def leftover_wip_versions(store: TransactionalKeyValueStore) -> list[str]:
-    """Returns the ids of all objects that have a work-in-progress version."""
-    return [
-        object_id
-        for object_id, entry in store.key_value_store.items()
-        if entry.wip is not None
-    ]
-
-
-def check_all_schedules(
-    store_factory: Callable[[], TransactionalKeyValueStore],
-) -> ScheduleCheck:
-    """Runs every schedule, each on a fresh store filled with INITIAL_STATE, and stops at the first violation.
-
-    A violation is an exception of the store other than TransactionAbortedException, a work-in-progress version
-    left after all transactions ended, or a difference from the serial replay. The check also counts the schedules
-    in which two concurrent writers both committed and those with an abort in the validation phase.
-    """
-    check: ScheduleCheck = ScheduleCheck()
-    schedule: Schedule
-    for schedule in schedules(OPERATIONS, MAX_OPERATIONS):
-        check.schedules_run += 1
-        store: TransactionalKeyValueStore = store_factory()
-        for key, row in INITIAL_STATE.items():
-            store.put(key, row)
-        run: ScheduleRun = run_schedule(store, schedule)
-        violation: str | None = run.error
-        if violation is None:
-            # every transaction ended, so no work-in-progress version may be left:
-            leftover: list[str] = leftover_wip_versions(store)
-            if leftover:
-                violation = f"work-in-progress versions left for {leftover}"
-        if violation is None:
-            violation = serializability_violation(
-                INITIAL_STATE, run.records, run.final_state
-            )
-        if violation is not None:
-            check.violation = f"{violation}\n\n{format_schedule(run)}"
-            return check
-        t_1, t_2 = run.records
-        if t_1.aborted_at_commit or t_2.aborted_at_commit:
-            check.validation_aborts += 1
-        # the two transactions overlapped in time if each one started before the other one ended:
-        overlapped: bool = (
-            t_1.first_position < t_2.last_position
-            and t_2.first_position < t_1.last_position
-        )
-        if overlapped and t_1.committed and t_2.committed and t_1.wrote and t_2.wrote:
-            check.concurrent_writers += 1
-    return check
+# all schedules of two transactions with one to three data operations each, at most one of them with three, over
+# the six data operations of THREE_TRANSACTIONS; run nightly only. A longer transaction can e.g. read, write and
+# read again, so it sees its own writes and is validated against several read predicates. Two transactions with
+# three data operations each would make the run about six times longer:
+TWO_LONGER_TRANSACTIONS: ScheduleSpace = ScheduleSpace(
+    INITIAL_STATE,
+    THREE_TRANSACTIONS.data_operations,
+    frozenset(itertools.product((1, 2, 3), repeat=2)) - {(3, 3)},
+)
 
 
 class StoreWithoutValidation(TransactionalKeyValueStore):
@@ -506,47 +194,103 @@ class StoreThatCrashesOnDelete(TransactionalKeyValueStore):
         raise RuntimeError(f"cannot delete {object_id}")
 
 
-class SerializabilityTest(unittest.TestCase):
-    """Runs all schedules of two transactions on the store and checks the oracle itself."""
+def all_ordered_interleavings(
+    transactions: list[Transaction],
+) -> Iterator[Schedule]:
+    """Yields every interleaving of the transactions whose begins are in index order, by choosing positions.
+
+    Used to check :func:`system.playground.schedules.interleavings` independently: each transaction in turn takes
+    any of the positions left.
+    """
+    total_operations: int = sum(len(transaction) for transaction in transactions)
+
+    def place(index: int, free: tuple[int, ...]) -> Iterator[list[tuple[int, ...]]]:
+        """Yields the positions of transactions index, index + 1, ... among the free positions."""
+        # all transactions are placed:
+        if index == len(transactions):
+            yield []
+            return
+        chosen: tuple[int, ...]
+        # transaction index takes any of the free positions, in increasing order (its operations keep their order) ...
+        for chosen in itertools.combinations(free, len(transactions[index])):
+            rest: tuple[int, ...] = tuple(p for p in free if p not in chosen)
+            # ... and the later transactions share the positions left:
+            for placement in place(index + 1, rest):
+                yield [chosen, *placement]
+
+    for placement in place(0, tuple(range(total_operations))):
+        # the begin of each transaction is at the first of its positions; keep only placements in begin order:
+        begins: list[int] = [positions[0] for positions in placement]
+        if begins != sorted(begins):
+            continue
+        # put every operation at its position:
+        schedule: list[ScheduledOperation | None] = [None] * total_operations
+        for index, positions in enumerate(placement):
+            for position, operation in zip(positions, transactions[index]):
+                schedule[position] = ScheduledOperation(index, operation)
+        # every position was filled, as the placement uses all positions:
+        assert None not in schedule
+        yield cast(Schedule, tuple(schedule))
+
+
+class ExhaustiveTestCase(unittest.TestCase):
+    """Base class of the test classes that run all schedules of a schedule space."""
 
     def _assert_serializable(
-        self, store_factory: Callable[[], TransactionalKeyValueStore]
-    ) -> None:
-        """Asserts that every schedule commits a serializable history and that the run was not trivial."""
-        check: ScheduleCheck = check_all_schedules(store_factory)
+        self,
+        store_factory: Callable[[], TransactionalKeyValueStore],
+        space: ScheduleSpace,
+        expected_schedules: int,
+    ) -> ScheduleCheck:
+        """Asserts that every schedule commits a serializable history and that the run was not trivial.
+
+        expected_schedules is fixed in the test, so a change of the schedule space is noticed. Returns the check,
+        so that a test can assert more of its counters.
+        """
+        check: ScheduleCheck = check_all_schedules(store_factory, space)
         if check.violation is not None:
             self.fail(check.violation)
-        # 255,960 = number_of_schedules(9, 2); fixed here so a change of OPERATIONS is noticed:
-        self.assertEqual(255_960, check.schedules_run)
-        self.assertEqual(
-            number_of_schedules(len(OPERATIONS), MAX_OPERATIONS), check.schedules_run
-        )
+        self.assertEqual(expected_schedules, check.schedules_run)
+        self.assertEqual(number_of_schedules(space), check.schedules_run)
         # in some schedules two concurrent writers both commit, and in some the validation aborts a transaction
         # (these checks only rule out a store that aborts all concurrent writers or never aborts at validation):
-        self.assertGreater(check.concurrent_writers, 0)
+        self.assertGreater(check.overlapping_committed_writers, 0)
         self.assertGreater(check.validation_aborts, 0)
+        return check
+
+
+class SerializabilityTest(ExhaustiveTestCase):
+    """Runs all schedules of two transactions on the store and checks the oracle itself."""
 
     def test_validation_method_1_brute_force(self) -> None:
         """Every schedule committed under validation method 1 (checksums of read results) is serializable."""
         self._assert_serializable(
-            lambda: TransactionalKeyValueStore(use_brute_force_validation=True)
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=True),
+            TWO_TRANSACTIONS,
+            255_960,
         )
 
     def test_validation_method_2_write_sets(self) -> None:
         """Every schedule committed under validation method 2 (write sets) is serializable."""
         self._assert_serializable(
-            lambda: TransactionalKeyValueStore(use_brute_force_validation=False)
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=False),
+            TWO_TRANSACTIONS,
+            255_960,
         )
 
     def test_store_without_validation_is_caught(self) -> None:
         """A store that skips validation commits a schedule whose reads differ from the serial order."""
-        check: ScheduleCheck = check_all_schedules(StoreWithoutValidation)
+        check: ScheduleCheck = check_all_schedules(
+            StoreWithoutValidation, TWO_TRANSACTIONS
+        )
         self.assertIsNotNone(check.violation)
         self.assertIn("in the serial order it returns", check.violation)
 
     def test_crash_of_store_is_reported_with_schedule(self) -> None:
         """An exception other than TransactionAbortedException is reported together with the schedule table."""
-        check: ScheduleCheck = check_all_schedules(StoreThatCrashesOnDelete)
+        check: ScheduleCheck = check_all_schedules(
+            StoreThatCrashesOnDelete, TWO_TRANSACTIONS
+        )
         self.assertIsNotNone(check.violation)
         self.assertIn("delete x: raised RuntimeError: cannot delete x", check.violation)
         self.assertIn("serial order:", check.violation)
@@ -554,7 +298,7 @@ class SerializabilityTest(unittest.TestCase):
     def test_leftover_versions_are_reported(self) -> None:
         """A work-in-progress version left after all transactions ended is reported with the schedule table."""
         check: ScheduleCheck = check_all_schedules(
-            StoreThatKeepsVersionsOfAbortedTransactions
+            StoreThatKeepsVersionsOfAbortedTransactions, TWO_TRANSACTIONS
         )
         self.assertIsNotNone(check.violation)
         self.assertIn("work-in-progress versions left for", check.violation)
@@ -563,7 +307,9 @@ class SerializabilityTest(unittest.TestCase):
 
     def test_commit_without_timestamp_is_reported(self) -> None:
         """A commit that leaves the commit timestamp unset is reported with the schedule table."""
-        check: ScheduleCheck = check_all_schedules(StoreWithoutCommitTimestamp)
+        check: ScheduleCheck = check_all_schedules(
+            StoreWithoutCommitTimestamp, TWO_TRANSACTIONS
+        )
         self.assertIsNotNone(check.violation)
         self.assertIn(
             "commit: raised RuntimeError: commit left committed_timestamp None",
@@ -571,26 +317,85 @@ class SerializabilityTest(unittest.TestCase):
         )
         self.assertIn("serial order:", check.violation)
 
+    def test_voluntary_abort_leaves_no_trace(self) -> None:
+        """Transactions that abort on their own, also after writing, leave every schedule serializable.
+
+        A small space with two data operations runs in the regular test job; TWO_TRANSACTIONS_WITH_ABORT runs
+        nightly.
+        """
+        space: ScheduleSpace = ScheduleSpace(
+            INITIAL_STATE,
+            (
+                DataOperation("read", a_equals=1),
+                DataOperation("update", "y", Row(1, 0)),
+            ),
+            TWO_TRANSACTIONS.data_operation_counts,
+            endings=("commit", "abort"),
+        )
+        for use_brute_force_validation in (True, False):
+            with self.subTest(use_brute_force_validation=use_brute_force_validation):
+                check: ScheduleCheck = check_all_schedules(
+                    functools.partial(
+                        TransactionalKeyValueStore,
+                        use_brute_force_validation=use_brute_force_validation,
+                    ),
+                    space,
+                )
+                if check.violation is not None:
+                    self.fail(check.violation)
+                self.assertEqual(number_of_schedules(space), check.schedules_run)
+
     def test_number_of_schedules(self) -> None:
         """The enumeration yields exactly the intended schedules.
 
         Their number matches the closed form, all of them are different, and each one is an interleaving of two
-        programs in which the first one begins first.
+        transactions in which the first one begins first.
         """
-        operations: list[Op] = OPERATIONS[:2]
-        all_programs: list[list[Step]] = programs(operations, 2)
-        generated: list[tuple[tuple[int, Step], ...]] = [
-            tuple(schedule) for schedule in schedules(operations, 2)
-        ]
-        self.assertEqual(number_of_schedules(len(operations), 2), len(generated))
+        space: ScheduleSpace = ScheduleSpace(
+            INITIAL_STATE, DATA_OPERATIONS[:2], TWO_TRANSACTIONS.data_operation_counts
+        )
+        candidates: list[Transaction] = all_transactions(space.data_operations, 2)
+        generated: list[Schedule] = list(schedules(space))
+        self.assertEqual(number_of_schedules(space), len(generated))
         self.assertEqual(len(generated), len(set(generated)))
         for schedule in generated:
-            self.assertEqual((0, "begin"), schedule[0])
+            self.assertEqual(ScheduledOperation(0, "begin"), schedule[0])
             for transaction_index in (0, 1):
-                program: list[Step] = [
-                    step for index, step in schedule if index == transaction_index
+                transaction: Transaction = [
+                    scheduled.operation
+                    for scheduled in schedule
+                    if scheduled.transaction_index == transaction_index
                 ]
-                self.assertIn(program, all_programs)
+                self.assertIn(transaction, candidates)
+
+    def test_schedules_of_three_transactions(self) -> None:
+        """For three transactions, the enumeration yields the interleavings that begin in index order.
+
+        The expected set is built independently of :func:`interleavings`: every interleaving of every choice of
+        T1, T2, T3, by choosing the positions of each transaction's operations, filtered to those that begin in index
+        order.
+        """
+        space: ScheduleSpace = ScheduleSpace(
+            INITIAL_STATE, DATA_OPERATIONS[:2], THREE_TRANSACTIONS.data_operation_counts
+        )
+        expected: set[Schedule] = set()
+        # the largest number of data operations of a transaction in space:
+        max_operations: int = max(max(counts) for counts in space.data_operation_counts)
+        transactions: tuple[Transaction, ...]
+        for transactions in itertools.product(
+            all_transactions(space.data_operations, max_operations), repeat=3
+        ):
+            # a transaction has two operations (begin, commit) besides its data operations:
+            counts: tuple[int, ...] = tuple(
+                len(transaction) - 2 for transaction in transactions
+            )
+            if counts not in space.data_operation_counts:
+                continue
+            expected.update(all_ordered_interleavings(list(transactions)))
+        generated: list[Schedule] = list(schedules(space))
+        self.assertEqual(len(generated), len(set(generated)))
+        self.assertEqual(expected, set(generated))
+        self.assertEqual(number_of_schedules(space), len(generated))
 
     def test_oracle_rejects_write_skew(self) -> None:
         """The oracle rejects write skew: no serial order explains both reads.
@@ -613,9 +418,11 @@ class SerializabilityTest(unittest.TestCase):
         t_1: TransactionRecord = TransactionRecord(
             name="T1",
             TA_id=1,
-            operations=[
-                (Op("read", a_equals=1), (("x", x),)),
-                (Op("update", "y", Row(1, 0)), None),
+            data_operations=[
+                ExecutedDataOperation(
+                    DataOperation("read", a_equals=1), (StoredObject("x", x),)
+                ),
+                ExecutedDataOperation(DataOperation("update", "y", Row(1, 0))),
             ],
             committed=True,
             commit_timestamp=3,
@@ -623,9 +430,11 @@ class SerializabilityTest(unittest.TestCase):
         t_2: TransactionRecord = TransactionRecord(
             name="T2",
             TA_id=2,
-            operations=[
-                (Op("read", a_equals=1), (("x", x),)),
-                (Op("delete", "x"), None),
+            data_operations=[
+                ExecutedDataOperation(
+                    DataOperation("read", a_equals=1), (StoredObject("x", x),)
+                ),
+                ExecutedDataOperation(DataOperation("delete", "x")),
             ],
             committed=True,
             commit_timestamp=4,
@@ -655,9 +464,11 @@ class SerializabilityTest(unittest.TestCase):
         t_1: TransactionRecord = TransactionRecord(
             name="T1",
             TA_id=1,
-            operations=[
-                (Op("read", a_equals=1), (("x", x),)),
-                (Op("update", "y", Row(1, 0)), None),
+            data_operations=[
+                ExecutedDataOperation(
+                    DataOperation("read", a_equals=1), (StoredObject("x", x),)
+                ),
+                ExecutedDataOperation(DataOperation("update", "y", Row(1, 0))),
             ],
             committed=True,
             commit_timestamp=2,
@@ -665,9 +476,12 @@ class SerializabilityTest(unittest.TestCase):
         t_2: TransactionRecord = TransactionRecord(
             name="T2",
             TA_id=3,
-            operations=[
-                (Op("read", a_equals=1), (("x", x), ("y", Row(1, 0)))),
-                (Op("delete", "x"), None),
+            data_operations=[
+                ExecutedDataOperation(
+                    DataOperation("read", a_equals=1),
+                    (StoredObject("x", x), StoredObject("y", Row(1, 0))),
+                ),
+                ExecutedDataOperation(DataOperation("delete", "x")),
             ],
             committed=True,
             commit_timestamp=4,
@@ -695,14 +509,20 @@ class SerializabilityTest(unittest.TestCase):
         t_1: TransactionRecord = TransactionRecord(
             name="T1",
             TA_id=1,
-            operations=[(Op("read", a_equals=1), (("x", x),))],
+            data_operations=[
+                ExecutedDataOperation(
+                    DataOperation("read", a_equals=1), (StoredObject("x", x),)
+                )
+            ],
             committed=True,
             commit_timestamp=4,
         )
         t_2: TransactionRecord = TransactionRecord(
             name="T2",
             TA_id=2,
-            operations=[(Op("update", "x", Row(0, 0)), None)],
+            data_operations=[
+                ExecutedDataOperation(DataOperation("update", "x", Row(0, 0)))
+            ],
             committed=True,
             commit_timestamp=3,
         )
@@ -711,18 +531,401 @@ class SerializabilityTest(unittest.TestCase):
         )
 
     def test_oracle_rejects_wrong_final_state(self) -> None:
-        """All reads match the serial order, but the store lost the update of the only transaction."""
+        """The oracle rejects a final state that lacks the update of the only committed transaction."""
         x: Row = Row(1, 0)
         t_1: TransactionRecord = TransactionRecord(
             name="T1",
             TA_id=1,
-            operations=[(Op("update", "x", Row(0, 0)), None)],
+            data_operations=[
+                ExecutedDataOperation(DataOperation("update", "x", Row(0, 0)))
+            ],
             committed=True,
             commit_timestamp=2,
         )
         violation: str | None = serializability_violation({"x": x}, [t_1], {"x": x})
         self.assertIsNotNone(violation)
         self.assertIn("final state", violation)
+
+
+class OracleThreeTransactionsTest(unittest.TestCase):
+    """Checks the oracle and the schedule runs with three transactions in the regular test job."""
+
+    def test_oracle_rejects_inconsistent_read_of_third_transaction(self) -> None:
+        """Only T3's read differs from the serial order T1, T3, T2, so the violation names T3.
+
+        The records are made up to feed the oracle. T3's read is one the store must not produce: T3 begins after
+        T1's commit, so it has to see y.
+
+        ```text
+        T1                     T2                          T3
+        begin
+        update y=Row(1,0)
+        commit
+                               begin
+                                                           begin
+                               read all -> {x, y, z}
+                               update x=Row(0,0)
+                                                           read all -> {x, z}
+                                                           commit
+                               commit
+        ```
+        """
+        x: Row = Row(1, 0)
+        y: Row = Row(1, 0)
+        z: Row = Row(0, 0)
+        t_1: TransactionRecord = TransactionRecord(
+            name="T1",
+            TA_id=1,
+            data_operations=[ExecutedDataOperation(DataOperation("update", "y", y))],
+            committed=True,
+            commit_timestamp=2,
+        )
+        t_2: TransactionRecord = TransactionRecord(
+            name="T2",
+            TA_id=3,
+            data_operations=[
+                ExecutedDataOperation(
+                    DataOperation("read"),
+                    (StoredObject("x", x), StoredObject("y", y), StoredObject("z", z)),
+                ),
+                ExecutedDataOperation(DataOperation("update", "x", Row(0, 0))),
+            ],
+            committed=True,
+            commit_timestamp=6,
+        )
+        # T3 is read-only and placed at its begin (4), after T1's commit: it should have seen y:
+        t_3: TransactionRecord = TransactionRecord(
+            name="T3",
+            TA_id=4,
+            data_operations=[
+                ExecutedDataOperation(
+                    DataOperation("read"), (StoredObject("x", x), StoredObject("z", z))
+                )
+            ],
+            committed=True,
+            commit_timestamp=5,
+        )
+        violation: str | None = serializability_violation(
+            {"x": x, "z": z}, [t_1, t_2, t_3], {"x": Row(0, 0), "y": y, "z": z}
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("T3: read all", violation)
+
+    def test_store_without_validation_is_caught_with_three_transactions(self) -> None:
+        """A store that skips validation is caught in a small three-transaction space.
+
+        The space has two data operations, so it runs in the regular test job.
+        """
+        space: ScheduleSpace = ScheduleSpace(
+            INITIAL_STATE,
+            (
+                DataOperation("read", a_equals=1),
+                DataOperation("update", "x", Row(0, 0)),
+            ),
+            frozenset({(2, 1, 1), (1, 2, 1), (1, 1, 2)}),
+        )
+        check: ScheduleCheck = check_all_schedules(StoreWithoutValidation, space)
+        self.assertIsNotNone(check.violation)
+        self.assertIn("in the serial order it returns", check.violation)
+
+    def test_two_commits_during_writer_are_counted_on_the_store(self) -> None:
+        """Blind writes of three transactions on the store give schedules with two commits during a writer.
+
+        All of these schedules are serializable.
+        """
+        space: ScheduleSpace = ScheduleSpace(
+            INITIAL_STATE,
+            (
+                DataOperation("update", "y", Row(1, 0)),
+                DataOperation("update", "z", Row(1, 0)),
+            ),
+            frozenset({(1, 1, 1)}),
+        )
+        for use_brute_force_validation in (True, False):
+            with self.subTest(use_brute_force_validation=use_brute_force_validation):
+                check: ScheduleCheck = check_all_schedules(
+                    functools.partial(
+                        TransactionalKeyValueStore,
+                        use_brute_force_validation=use_brute_force_validation,
+                    ),
+                    space,
+                )
+                if check.violation is not None:
+                    self.fail(check.violation)
+                self.assertGreater(check.two_commits_during_writer, 0)
+
+
+def made_up_writer(
+    name: str,
+    first_position: int,
+    last_position: int,
+    committed: bool = True,
+    aborted_at_commit: bool = False,
+) -> TransactionRecord:
+    """Returns a made-up record of a transaction that wrote x and ran from first_position to last_position."""
+    return TransactionRecord(
+        name=name,
+        data_operations=[
+            ExecutedDataOperation(DataOperation("update", "x", Row(0, 0)))
+        ],
+        committed=committed,
+        aborted=aborted_at_commit,
+        aborted_at_commit=aborted_at_commit,
+        first_position=first_position,
+        last_position=last_position,
+    )
+
+
+def made_up_reader(
+    name: str, first_position: int, last_position: int
+) -> TransactionRecord:
+    """Returns a made-up record of a committed read-only transaction that ran from first_position to last_position."""
+    return TransactionRecord(
+        name=name,
+        data_operations=[ExecutedDataOperation(DataOperation("read"), ())],
+        committed=True,
+        first_position=first_position,
+        last_position=last_position,
+    )
+
+
+class ScheduleSpaceTest(unittest.TestCase):
+    """Checks that a schedule space rejects data operation counts that the enumeration cannot handle."""
+
+    def test_rejects_transaction_without_data_operation(self) -> None:
+        """Every transaction needs at least one data operation."""
+        with self.assertRaisesRegex(ValueError, "at least one data operation"):
+            ScheduleSpace(INITIAL_STATE, DATA_OPERATIONS, frozenset({(0, 1), (1, 0)}))
+
+    def test_rejects_operation_counts_not_closed_under_reordering(self) -> None:
+        """With (2, 1) allowed, (1, 2) must be allowed as well, as transactions are numbered in begin order."""
+        with self.assertRaisesRegex(ValueError, r"must contain \(1, 2\)"):
+            ScheduleSpace(INITIAL_STATE, DATA_OPERATIONS, frozenset({(2, 1)}))
+
+    def test_rejects_different_numbers_of_transactions(self) -> None:
+        """All schedules of a space have the same number of transactions."""
+        with self.assertRaisesRegex(ValueError, "same length"):
+            ScheduleSpace(
+                INITIAL_STATE, DATA_OPERATIONS, frozenset({(1, 1), (1, 1, 1)})
+            )
+
+    def test_rejects_empty_operation_counts(self) -> None:
+        """A space without any data operation counts has no schedules and no number of transactions."""
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            ScheduleSpace(INITIAL_STATE, DATA_OPERATIONS, frozenset())
+
+    def test_rejects_schedules_without_transactions(self) -> None:
+        """A schedule has at least one transaction."""
+        with self.assertRaisesRegex(ValueError, "at least one transaction"):
+            ScheduleSpace(INITIAL_STATE, DATA_OPERATIONS, frozenset({()}))
+
+
+class CountersTest(unittest.TestCase):
+    """Checks the helpers that count interesting schedules on made-up records."""
+
+    def test_overlapping_committed_writers(self) -> None:
+        """Two committed writers overlap if each one begins before the other one ends.
+
+        Positions are indexes in the schedule.
+        """
+        self.assertTrue(
+            overlapping_committed_writers(
+                [made_up_writer("T1", 0, 5), made_up_writer("T2", 2, 7)]
+            )
+        )
+        # T2 begins after T1 ended:
+        self.assertFalse(
+            overlapping_committed_writers(
+                [made_up_writer("T1", 0, 3), made_up_writer("T2", 4, 7)]
+            )
+        )
+        # an aborted writer does not count:
+        self.assertFalse(
+            overlapping_committed_writers(
+                [
+                    made_up_writer("T1", 0, 5),
+                    made_up_writer("T2", 2, 7, committed=False),
+                ]
+            )
+        )
+        # a read-only transaction does not count:
+        self.assertFalse(
+            overlapping_committed_writers(
+                [made_up_writer("T1", 0, 5), made_up_reader("T2", 2, 7)]
+            )
+        )
+
+    def test_two_commits_during_writer(self) -> None:
+        """Two writers that commit between the begin and the commit of a third writer are counted.
+
+        Each record also contains a write of x; it has no position of its own and is not shown.
+
+        ```text
+        T1                T2                T3
+        begin
+                          begin
+                                            begin
+                          commit
+                                            commit
+        commit
+        ```
+        """
+        self.assertTrue(
+            two_commits_during_writer(
+                [
+                    made_up_writer("T1", 0, 5),
+                    made_up_writer("T2", 1, 3),
+                    made_up_writer("T3", 2, 4),
+                ]
+            )
+        )
+
+    def test_two_commits_during_writer_aborted_at_commit(self) -> None:
+        """A writer aborted in its validation phase counts as well, as its validation saw the two commits."""
+        self.assertTrue(
+            two_commits_during_writer(
+                [
+                    made_up_writer("T1", 0, 5, committed=False, aborted_at_commit=True),
+                    made_up_writer("T2", 1, 3),
+                    made_up_writer("T3", 2, 4),
+                ]
+            )
+        )
+
+    def test_one_commit_during_each_writer_is_not_counted(self) -> None:
+        """Each writer sees at most one other commit during its run.
+
+        Each record also contains a write of x; it has no position of its own and is not shown.
+
+        ```text
+        T1                T2                T3
+        begin
+                          begin
+                          commit
+                                            begin
+        commit
+                                            commit
+        ```
+        """
+        self.assertFalse(
+            two_commits_during_writer(
+                [
+                    made_up_writer("T1", 0, 4),
+                    made_up_writer("T2", 1, 2),
+                    made_up_writer("T3", 3, 5),
+                ]
+            )
+        )
+
+    def test_commits_of_readers_or_around_a_reader_are_not_counted(self) -> None:
+        """A read-only transaction neither counts as a commit nor as the transaction that sees the commits."""
+        # T3 is read-only, so only one writer commits during T1:
+        self.assertFalse(
+            two_commits_during_writer(
+                [
+                    made_up_writer("T1", 0, 5),
+                    made_up_writer("T2", 1, 3),
+                    made_up_reader("T3", 2, 4),
+                ]
+            )
+        )
+        # T1 is read-only, so the two commits during it do not count:
+        self.assertFalse(
+            two_commits_during_writer(
+                [
+                    made_up_reader("T1", 0, 5),
+                    made_up_writer("T2", 1, 3),
+                    made_up_writer("T3", 2, 4),
+                ]
+            )
+        )
+
+
+@unittest.skipUnless(
+    os.environ.get("EXPLAINDB_NIGHTLY") == "1",
+    "takes about half an hour locally; set EXPLAINDB_NIGHTLY=1 (the nightly CI pipeline does)",
+)
+class NightlySerializabilityTest(ExhaustiveTestCase):
+    """Runs all schedules of the larger schedule spaces on the store (nightly)."""
+
+    def _assert_serializable_three(
+        self,
+        store_factory: Callable[[], TransactionalKeyValueStore],
+        space: ScheduleSpace,
+        expected_schedules: int,
+    ) -> None:
+        """Asserts that all schedules of space are serializable.
+
+        Also asserts that in some of them two writers commit while a third writer runs.
+        """
+        check: ScheduleCheck = self._assert_serializable(
+            store_factory, space, expected_schedules
+        )
+        self.assertGreater(check.two_commits_during_writer, 0)
+
+    def test_three_transactions_method_1_brute_force(self) -> None:
+        """Every schedule of THREE_TRANSACTIONS committed under validation method 1 is serializable."""
+        self._assert_serializable_three(
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=True),
+            THREE_TRANSACTIONS,
+            2_782_080,
+        )
+
+    def test_three_transactions_method_2_write_sets(self) -> None:
+        """Every schedule of THREE_TRANSACTIONS committed under validation method 2 is serializable."""
+        self._assert_serializable_three(
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=False),
+            THREE_TRANSACTIONS,
+            2_782_080,
+        )
+
+    def test_two_read_write_transactions_method_1_brute_force(self) -> None:
+        """Every schedule of THREE_TRANSACTIONS_TWO_READ_WRITE committed under method 1 is serializable."""
+        self._assert_serializable_three(
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=True),
+            THREE_TRANSACTIONS_TWO_READ_WRITE,
+            5_913_600,
+        )
+
+    def test_two_read_write_transactions_method_2_write_sets(self) -> None:
+        """Every schedule of THREE_TRANSACTIONS_TWO_READ_WRITE committed under method 2 is serializable."""
+        self._assert_serializable_three(
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=False),
+            THREE_TRANSACTIONS_TWO_READ_WRITE,
+            5_913_600,
+        )
+
+    def test_two_transactions_with_abort_method_1_brute_force(self) -> None:
+        """Every schedule of TWO_TRANSACTIONS_WITH_ABORT committed under method 1 is serializable."""
+        self._assert_serializable(
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=True),
+            TWO_TRANSACTIONS_WITH_ABORT,
+            1_023_840,
+        )
+
+    def test_two_transactions_with_abort_method_2_write_sets(self) -> None:
+        """Every schedule of TWO_TRANSACTIONS_WITH_ABORT committed under method 2 is serializable."""
+        self._assert_serializable(
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=False),
+            TWO_TRANSACTIONS_WITH_ABORT,
+            1_023_840,
+        )
+
+    def test_two_longer_transactions_method_1_brute_force(self) -> None:
+        """Every schedule of TWO_LONGER_TRANSACTIONS committed under method 1 is serializable."""
+        self._assert_serializable(
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=True),
+            TWO_LONGER_TRANSACTIONS,
+            1_105_632,
+        )
+
+    def test_two_longer_transactions_method_2_write_sets(self) -> None:
+        """Every schedule of TWO_LONGER_TRANSACTIONS committed under method 2 is serializable."""
+        self._assert_serializable(
+            lambda: TransactionalKeyValueStore(use_brute_force_validation=False),
+            TWO_LONGER_TRANSACTIONS,
+            1_105_632,
+        )
 
 
 if __name__ == "__main__":
