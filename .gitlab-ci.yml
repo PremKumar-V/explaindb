@@ -163,6 +163,17 @@ dependency_audit:
     - uv tool run --exclude-newer 2026-10-01T00:00:00Z pip-audit==2.10.1 --strict --no-deps --disable-pip --progress-spinner off --desc -r /tmp/audit-requirements.txt
   interruptible: true
 
+# Script lines shared by the jobs that compare a merge request with its target
+# branch (gitleaks_secret_detection, semgrep_sast); they need GIT_DEPTH: 0.
+.merge_base:
+  script:
+    # Fetch the current target branch explicitly: the runner's checkout may lack
+    # it or hold an old copy, and an old merge base would make the scan include
+    # commits that are already on the target branch.
+    - git fetch origin "+refs/heads/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME:refs/remotes/origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    # The commit the merge request branched off.
+    - BASELINE="$(git merge-base "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" HEAD)"
+
 # Secret detection with Gitleaks in merge requests: scans only the commits of
 # the merge request (from the merge base with the target branch to HEAD), so
 # old commits never block a merge request, and fails if one of them adds a
@@ -205,12 +216,9 @@ gitleaks_secret_detection:
     # Log the git version: GIT_ATTR_SOURCE needs git 2.42 or newer (an older
     # git ignores it silently), --remerge-diff below needs 2.36 or newer.
     - git --version
-    # Fetch the current target branch explicitly: the runner's checkout may lack
-    # it or hold an old copy, and an old merge base would make the scan include
-    # commits that are already on the target branch.
-    - git fetch origin "+refs/heads/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME:refs/remotes/origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    # The commit the merge request branched off: only commits after it are scanned.
-    - BASELINE="$(git merge-base "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" HEAD)"
+    # Sets BASELINE, the commit the merge request branched off: only commits
+    # after it are scanned.
+    - !reference [.merge_base, script]
     - echo "Scanning $(git rev-list --count "$BASELINE..HEAD") commit(s) after $BASELINE"
     # A fixed configuration with only the default rules: otherwise gitleaks
     # would read a .gitleaks.toml from the merge request itself, which could
@@ -240,6 +248,159 @@ gitleaks_secret_detection:
     when: always
     paths:
       - gitleaks-report.json
+    expire_in: 1 week
+  rules:
+    # Only in merge requests: the scan needs a target branch.
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  interruptible: true
+
+# Static analysis with Semgrep in merge requests: fails only on findings that
+# the merge request introduces (compared with the merge base with the target
+# branch), so older code never blocks a merge request. Rulesets p/security-audit
+# and p/python; Semgrep's default exclusions apply (e.g. tests/ and everything in
+# .gitignore). Semgrep does not read notebooks, so the code cells of the
+# notebooks the merge request changes are written to Python files first and
+# scanned in full. Suppressions are listed in the log, together with the
+# findings they hide, and must name a rule. CONTRIBUTING.md explains how to
+# accept an intentional finding (see also docs/changes/008-semgrep-sast).
+semgrep_sast:
+  # In the first stage: the job is quick, and if it finds something the test
+  # stage does not run at all. It needs detect-docs-only (same stage) for the
+  # DOCS_ONLY variable.
+  stage: prepare
+  needs:
+    - detect-docs-only
+  tags:
+    - test
+  # The official image, pinned by tag and digest (a checksum of the exact
+  # image); bump both together. The rulesets themselves are downloaded at scan
+  # time and are not pinned, so a new rule can flag new code without a change
+  # here.
+  image: semgrep/semgrep:1.173.0@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a
+  variables:
+    # Full history, so that the merge base with the target branch can be found.
+    GIT_DEPTH: 0
+    # Read git attributes from the empty tree instead of the merge request's
+    # .gitattributes (as in gitleaks_secret_detection): an entry such as
+    # `*.py -diff` would hide the added lines from `git diff` and so from the
+    # suppression check below.
+    GIT_ATTR_SOURCE: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+    # The options of all scans below. --metrics=off: send no usage data to
+    # Semgrep's servers. --max-target-bytes=0: scan files of any size (by
+    # default Semgrep skips files over 1 MB without failing).
+    SCAN_OPTIONS: --metrics=off --max-target-bytes=0 --config p/security-audit --config p/python
+  # The job fetches from GitLab and downloads the rulesets; one retry absorbs a
+  # network hiccup. A real finding simply fails twice.
+  retry:
+    max: 1
+    when:
+      - script_failure
+  script:
+    # Skip when the merge request only changes Markdown (see detect-docs-only).
+    - if [ "$DOCS_ONLY" = "true" ]; then echo "Only Markdown changed; skipping."; exit 0; fi
+    # Avoid git's "dubious ownership" error on a checkout owned by another user.
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    # Log the git version: GIT_ATTR_SOURCE needs git 2.42 or newer (an older
+    # git ignores it silently).
+    - git --version
+    # Sets BASELINE, the commit the merge request branched off: only findings
+    # that are new since then fail the job.
+    - !reference [.merge_base, script]
+    - echo "Reporting findings introduced since $BASELINE"
+    # The image expects the code mounted at /src unless this variable is unset;
+    # GitLab checks the code out into the working directory instead.
+    - unset SEMGREP_IN_DOCKER
+    # Files must not drop out of the scan without a trace in the code: adding
+    # or changing a .semgrepignore fails the job, and so does a file of the
+    # merge request that matches a .gitignore (Semgrep may skip such files
+    # although git tracks them). git check-ignore exits with 0 if a file
+    # matches, 1 if none does, and 128 on an error.
+    - |
+      if git diff --name-only "$BASELINE" HEAD | grep -E '(^|/)\.semgrepignore$'; then
+        echo "A .semgrepignore would remove files from the scan; change this job instead."
+        exit 1
+      fi
+      status=0
+      git diff -z --name-only --diff-filter=d "$BASELINE" HEAD | git check-ignore -z --no-index --stdin > /tmp/ignored || status=$?
+      if [ "$status" -eq 0 ]; then
+        tr '\0' '\n' < /tmp/ignored
+        echo "These files match a .gitignore, so Semgrep may not scan them; change the .gitignore."
+        exit 1
+      elif [ "$status" -ne 1 ]; then
+        echo "git check-ignore failed."
+        exit 1
+      fi
+    # Suppressions must stay visible to reviewers. In the Python files the
+    # merge request changes (tests are not scanned anyway), every added line
+    # that mentions a Semgrep suppression is listed in the log, and each must be
+    # a comment of its own that names a rule; a bare or differently written
+    # suppression, or one at the end of a line of code, fails the job. (A
+    # correctly written one on a line of its own inside a multi-line string
+    # passes, but is listed as well.) awk reads only the
+    # lines inside the diff's hunks (after "@@"), so that the "+++ b/<path>"
+    # header lines never count. Suppressions in notebooks are checked further
+    # below, on the converted code.
+    - git diff -U0 "$BASELINE" HEAD -- '*.py' '*.pyi' ':(exclude)*/tests/*' | awk '/^diff --git /{hunk=0} /^@@/{hunk=1; next} hunk && /^\+/ && tolower($0) ~ /nosem/' > /tmp/suppressions
+    - |
+      if [ -s /tmp/suppressions ]; then
+        echo "Suppressions added by this merge request (reviewers check each):"
+        cat /tmp/suppressions
+        if grep -vE '^\+[[:space:]]*# nosemgrep: [A-Za-z0-9_.-]+$' /tmp/suppressions; then
+          echo "A suppression must be a comment line of its own that names a rule: # nosemgrep: <rule-id>"
+          exit 1
+        fi
+        # The new findings, including those the suppressions hide, for the
+        # reviewers; this scan does not fail the job.
+        echo "All findings, including those hidden by suppressions (for review only):"
+        semgrep scan $SCAN_OPTIONS --baseline-commit "$BASELINE" --disable-nosem || true
+      fi
+    # --error fails the job on a new finding. The findings are printed to the
+    # log; a copy in GitLab's SAST format is kept as an artifact (for the Python
+    # files only; findings in notebooks appear only in the log).
+    - >
+      semgrep scan
+      $SCAN_OPTIONS
+      --baseline-commit "$BASELINE"
+      --error
+      --gitlab-sast-output=gl-sast-report.json
+    # Semgrep cannot read notebooks, and its comparison with the merge base only
+    # covers files in git. So the code cells of the notebooks that the merge
+    # request changes (deleted ones left out) are written to Python files by
+    # .ci/notebook_code.py, and these files are scanned in full. Unchanged
+    # notebooks are not scanned, so that a new rule cannot block an unrelated
+    # merge request. The file names are separated by NUL bytes (-z), so that
+    # any name works. The script fails if a notebook's code is not valid Python
+    # after the conversion, as Semgrep would skip such code with only a warning.
+    # In the converted code, every line that mentions a suppression is listed
+    # for the reviewers, with the findings it hides, and must be a comment of
+    # its own that names a rule (as in the Python files above).
+    - git diff -z --name-only --diff-filter=d "$BASELINE" HEAD -- '*.ipynb' > /tmp/changed_notebooks
+    - |
+      if [ -s /tmp/changed_notebooks ]; then
+        # Whether code is valid Python depends on the Python version (e.g. f-strings
+        # in 3.12), which should match the project's.
+        python3 --version
+        xargs -0 python3 .ci/notebook_code.py /tmp/notebook_code < /tmp/changed_notebooks
+        grep -rinE 'nosem' /tmp/notebook_code > /tmp/notebook_suppressions || true
+        if [ -s /tmp/notebook_suppressions ]; then
+          echo "Suppressions in the changed notebooks (reviewers check the new ones):"
+          cat /tmp/notebook_suppressions
+          if grep -vE '^[^:]+:[0-9]+:[[:space:]]*# nosemgrep: [A-Za-z0-9_.-]+$' /tmp/notebook_suppressions; then
+            echo "A suppression must be a comment line of its own that names a rule: # nosemgrep: <rule-id>"
+            exit 1
+          fi
+          echo "All findings, including those hidden by suppressions (for review only):"
+          semgrep scan $SCAN_OPTIONS --disable-nosem /tmp/notebook_code || true
+        fi
+        semgrep scan $SCAN_OPTIONS --error /tmp/notebook_code
+      else
+        echo "No notebook changed."
+      fi
+  artifacts:
+    # Keep the report also when the job fails.
+    when: always
+    reports:
+      sast: gl-sast-report.json
     expire_in: 1 week
   rules:
     # Only in merge requests: the scan needs a target branch.

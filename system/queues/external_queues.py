@@ -122,6 +122,8 @@ class ExternalQueue[ObjectType](ReadWriteQueue):
 
         # write contents of the buffer to the file:
         for element in self.buffer:
+            # the queue only reads back what it wrote itself, so pickle is safe here:
+            # nosemgrep: python.lang.security.deserialization.pickle.avoid-pickle
             pickle.dump(element, self.file)
 
         self.total_flushed_so_far += elements_written
@@ -144,6 +146,8 @@ class ExternalQueue[ObjectType](ReadWriteQueue):
         item_count = 0
         while item_count < self.memory_limit:
             try:
+                # the file holds only what this queue wrote (see flush):
+                # nosemgrep: python.lang.security.deserialization.pickle.avoid-pickle
                 item: ObjectType = pickle.load(self.file)
                 self.buffer.append(item)
                 item_count += 1

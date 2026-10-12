@@ -42,7 +42,8 @@ setting "Pipelines must succeed" is enabled.)
 
 ## Security checks
 
-Besides the dependency audit above, the CI scans every merge request for secrets.
+Besides the dependency audit above, the CI scans every merge request for secrets and for
+insecure code patterns.
 
 ### Secret detection
 
@@ -88,6 +89,59 @@ to git's empty tree, a fixed ID that git uses for an empty directory):
 git fetch origin
 printf '[extend]\nuseDefault = true\n' > /tmp/gitleaks.toml
 GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904 gitleaks git . --log-opts="--remerge-diff origin/main..HEAD" --config /tmp/gitleaks.toml --redact --verbose
+```
+
+### Static analysis
+
+The CI job `semgrep_sast` runs [Semgrep](https://semgrep.dev) with the rulesets
+`p/security-audit` and `p/python` and fails if the merge request introduces a new finding,
+e.g. a call of `eval` or `pickle.load`, which can run arbitrary code on untrusted input.
+Findings in older code do not fail the job. The job log lists each finding with its file,
+line and rule. Code in `tests/` folders is not scanned, and the job is skipped when a merge
+request only changes Markdown.
+
+Semgrep cannot read notebooks, so the job writes the code cells of every notebook the merge
+request changes to a Python file (`.ci/notebook_code.py`) and scans these in full: a finding
+anywhere in a changed notebook fails the job, not only a new one. IPython syntax is turned into
+Python first, keeping the Python code it runs (e.g. after `%time` or in a `%%time` cell). If
+the result is still not valid Python, the job fails, as Semgrep would skip that code; the log
+then names the notebook and shows the line that could not be read. For a finding, the log
+names `/tmp/notebook_code/<path of the notebook>.py` and a line in that file; search the
+notebook for the code shown in the log.
+
+The code after `%timeit -s` and the bodies of cell magics such as `%%writefile` or
+`%%script python3` are not scanned. A finding in `{...}` of a shell command or magic cannot be
+suppressed, and a comment line above `%%timeit` makes the conversion fail; rewrite such code
+as plain Python instead.
+
+If the code is wrong, fix it. If it is intentional (as `eval` and `pickle` in the teaching
+code of `system/` and of some notebooks), add `# nosemgrep: <rule>` on the line before the
+finding, in the same file or notebook cell, with the rule ID from the job log, and above it a
+comment that says why the code is safe:
+
+```python
+# the file was written by this program itself, so unpickling it is safe here:
+# nosemgrep: python.lang.security.deserialization.pickle.avoid-pickle
+for tup in pickle.load(f):
+```
+
+The job lists every added suppression in its log (for a changed notebook: all of its
+suppressions), and reviewers check each one. Below that list it shows all findings, including
+those the suppressions hide. The job fails if a suppression is not a comment line of its own
+in exactly this form (e.g. a bare `nosemgrep` without a rule, or one at the end of a line of
+code). It also fails if the merge request adds or changes a `.semgrepignore`, or changes a file
+that matches a `.gitignore`, as both would remove files from the scan. Suppressions are checked
+in Python files and notebooks only, not in other files Semgrep scans (e.g. YAML).
+
+To run the check locally, scan the changes that are not yet on `main`, then the notebooks you
+changed:
+
+```sh
+git fetch origin
+uv tool run --from semgrep==1.173.0 semgrep scan --metrics=off --config p/security-audit --config p/python --baseline-commit "$(git merge-base origin/main HEAD)"
+rm -rf /tmp/notebook_code
+uv run python .ci/notebook_code.py /tmp/notebook_code notebooks/<notebook>.ipynb
+uv tool run --from semgrep==1.173.0 semgrep scan --metrics=off --config p/security-audit --config p/python /tmp/notebook_code
 ```
 
 ## Notebooks

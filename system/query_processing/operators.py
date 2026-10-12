@@ -104,7 +104,9 @@ class Scan(Operator):
         with open(self.file, "rb") as f:
             # initialize iteration counter
             i = 0
-            # iterate over each tuple in file
+            # iterate over each tuple in file; unpickling can run code, so callers must
+            # only pass files that this program wrote itself:
+            # nosemgrep: python.lang.security.deserialization.pickle.avoid-pickle
             for tup in pickle.load(f):
                 if i < self.num_tuples:
                     # push current tuple to parent operator
@@ -178,7 +180,9 @@ class Filter(Operator):
 
         Pushes the tuple to the parent only if the predicate evaluates to true.
         """
-        # check predicate for given tuple
+        # check predicate for given tuple; eval runs any Python code, so callers must
+        # only pass predicates written in code, never user input:
+        # nosemgrep: python.lang.security.audit.eval-detected.eval-detected
         if eval(self.pred, {}, tup):
             # push current tuple to parent operator
             self.parent.interpret_next(tup)
