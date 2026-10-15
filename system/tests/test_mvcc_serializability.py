@@ -32,6 +32,7 @@ import unittest
 from collections.abc import Callable, Iterator
 from typing import cast
 
+from system.playground.mvcc_playground import StoreWithoutValidation
 from system.playground.schedules import (
     DataOperation,
     ExecutedDataOperation,
@@ -145,19 +146,6 @@ TWO_LONGER_TRANSACTIONS: ScheduleSpace = ScheduleSpace(
     THREE_TRANSACTIONS.data_operations,
     frozenset(itertools.product((1, 2, 3), repeat=2)) - {(3, 3)},
 )
-
-
-class StoreWithoutValidation(TransactionalKeyValueStore):
-    """A store whose validation never finds a conflict, so it commits non-serializable schedules."""
-
-    def _validate_transaction(
-        self, TA_id: int, commit_timestamp_for_this_TA: int
-    ) -> bool:
-        """See :meth:`TransactionalKeyValueStore._validate_transaction`.
-
-        Always passes, so no conflict is ever detected.
-        """
-        return True
 
 
 class StoreThatKeepsVersionsOfAbortedTransactions(TransactionalKeyValueStore):

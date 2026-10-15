@@ -451,15 +451,22 @@ def execute_operation(
     return str(operation)
 
 
-def run_schedule(store: TransactionalKeyValueStore, schedule: Schedule) -> ScheduleRun:
+def run_schedule(
+    store: TransactionalKeyValueStore,
+    schedule: Schedule,
+    operation_count: int | None = None,
+) -> ScheduleRun:
     """Runs schedule on store and records what each transaction did.
 
     A transaction aborted by the store skips its remaining operations. If the store raises any other exception, the run
     stops and the exception is recorded in error.
+
+    @param operation_count: run only the first operation_count operations; None runs all of them. Every transaction
+        of the whole schedule gets a record, also one that has not begun yet.
     """
-    # the transactions are numbered 0, 1, ..., so the largest index gives their number:
+    # the transactions are numbered 0, 1, ..., so the largest index gives their number (none in an empty schedule):
     number_of_transactions: int = 1 + max(
-        scheduled.transaction_index for scheduled in schedule
+        (scheduled.transaction_index for scheduled in schedule), default=-1
     )
     # one record per transaction, filled while its operations run (T1 for index 0, T2 for index 1, ...):
     records: list[TransactionRecord] = [
@@ -471,7 +478,7 @@ def run_schedule(store: TransactionalKeyValueStore, schedule: Schedule) -> Sched
     position: int
     scheduled: ScheduledOperation
     # run the operations in the order of the schedule; position is the operation's time in the schedule table:
-    for position, scheduled in enumerate(schedule):
+    for position, scheduled in enumerate(schedule[:operation_count]):
         transaction_index: int = scheduled.transaction_index
         operation: Operation = scheduled.operation
         record: TransactionRecord = records[transaction_index]
@@ -516,17 +523,21 @@ def serializability_violation(
     initial_state: dict[str, Row],
     records: list[TransactionRecord],
     final_state: dict[str, Row],
+    order: list[TransactionRecord] | None = None,
 ) -> str | None:
     """Replays the committed transactions serially and returns a description of the first difference, or None.
 
-    The transactions are replayed one after another in the order of their serialization points. Every read in the
-    replay must return what it returned in the concurrent run, and the final state must be the same. This check is
-    the oracle of the tests: it decides for every run whether the store behaved like this serial order.
+    The transactions are replayed one after another in the order of their serialization points, or in the given
+    order. Every read in the replay must return what it returned in the concurrent run, and the final state must be
+    the same. This check is the oracle of the tests: it decides for every run whether the store behaved like this
+    serial order.
+
+    @param order: the committed transactions in the order to replay them; None for the serialization points
     """
     # the state of the serial replay, a plain dictionary from object id to object:
     state: dict[str, Row] = dict(initial_state)
     # run the committed transactions one after another (aborted ones had no effect and are left out) ...
-    for record in serial_order(records):
+    for record in serial_order(records) if order is None else order:
         # ... each with its data operations in the order it ran them:
         for executed in record.data_operations:
             data_operation: DataOperation = executed.data_operation
