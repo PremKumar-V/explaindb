@@ -40,6 +40,10 @@ class Row:
     a: int
     b: int
 
+    def __str__(self) -> str:
+        """Shows the value stored under a key, e.g. ``(a=1, b=0)``."""
+        return f"(a={self.a}, b={self.b})"
+
 
 @dataclass(frozen=True)
 class DataOperation:
@@ -55,11 +59,11 @@ class DataOperation:
     a_equals: int | None = None
 
     def __str__(self) -> str:
-        """Shows the operation as in the schedule tables, e.g. ``update x=Row(1,0)``."""
+        """Shows the operation as in the schedule tables, e.g. ``update x ← (a=1, b=0)``."""
         if self.kind == "read":
             return "read all" if self.a_equals is None else f"read a=={self.a_equals}"
         if self.kind == "update":
-            return f"update {self.key}=Row({self.row.a},{self.row.b})"
+            return f"update {self.key} ← {self.row}"
         if self.kind == "delete":
             return f"delete {self.key}"
         raise ValueError(f"unknown operation kind {self.kind}")
@@ -71,7 +75,7 @@ Ending = Literal["commit", "abort"]
 # an operation of a transaction: begin, a data operation, commit or abort:
 Operation = Literal["begin"] | Ending | DataOperation
 
-# a transaction: begin, then its data operations, then commit or abort, e.g. begin, read a==1, update y=Row(1,0),
+# a transaction: begin, then its data operations, then commit or abort, e.g. begin, read a==1, update y ← (a=1, b=0),
 # commit. A schedule interleaves several transactions and keeps the order of the operations within each transaction:
 Transaction = list[Operation]
 
@@ -107,6 +111,8 @@ class ExecutedDataOperation:
     data_operation: DataOperation
     # None unless data_operation is a read:
     result: ReadResult | None = None
+    # the operation's position in the schedule, from 0; None for one not run from a schedule (e.g. made in a test):
+    position: int | None = None
 
 
 @dataclass(slots=True)
@@ -343,14 +349,9 @@ class ScheduleRun:
 
 
 def format_read_result(result: ReadResult) -> str:
-    """Shows a read result compactly, e.g. ``{x=Row(1,0)}``."""
+    """Shows a read result as keys and values, e.g. ``{x: (a=1, b=0)}``."""
     return (
-        "{"
-        + ", ".join(
-            f"{stored.object_id}=Row({stored.row.a},{stored.row.b})"
-            for stored in result
-        )
-        + "}"
+        "{" + ", ".join(f"{stored.object_id}: {stored.row}" for stored in result) + "}"
     )
 
 
@@ -385,18 +386,23 @@ def committed_state(store: TransactionalKeyValueStore) -> dict[str, Row]:
 
 
 def execute_operation(
-    store: TransactionalKeyValueStore, record: TransactionRecord, operation: Operation
+    store: TransactionalKeyValueStore,
+    record: TransactionRecord,
+    operation: Operation,
+    position: int,
 ) -> str:
     """Executes one operation of a transaction on store, records it in record, and returns the line for the table.
 
     Exceptions of the store, including TransactionAbortedException, are passed on to the caller. If the validation
     phase aborts a commit, record.aborted_at_commit is set before the exception is passed on. Raises RuntimeError
     if a commit leaves the commit timestamp unset.
+
+    @param position: the operation's position in the schedule, recorded with a data operation
     """
     if operation == "begin":
         # the store assigns the transaction id, which is also the begin of its snapshot:
         record.TA_id = store.begin_transaction()
-        return f"begin (TA_id {record.TA_id})"
+        return f"begin (ts {record.TA_id})"
     if operation == "abort":
         # the transaction gives up on its own: the store removes its work-in-progress versions; like any aborted
         # transaction it is left out of the serial replay:
@@ -417,7 +423,7 @@ def execute_operation(
             raise RuntimeError("commit left committed_timestamp None")
         record.commit_timestamp = commit_timestamp
         record.committed = True
-        return f"commit (timestamp {record.commit_timestamp})"
+        return f"commit (ts {record.commit_timestamp})"
     if operation.kind == "read":
         # a read with a == a_equals, or of all objects:
         where: WHERE_Clause | None = (
@@ -437,8 +443,10 @@ def execute_operation(
             )
         )
         # record what the transaction saw, the oracle checks it later:
-        record.data_operations.append(ExecutedDataOperation(operation, result))
-        return f"{operation} -> {format_read_result(result)}"
+        record.data_operations.append(
+            ExecutedDataOperation(operation, result, position)
+        )
+        return f"{operation} → {format_read_result(result)}"
     # a write creates a work-in-progress version, visible to other transactions only after the commit:
     if operation.kind == "update":
         store.update_object(operation.key, operation.row, record.TA_id)
@@ -447,7 +455,7 @@ def execute_operation(
     else:
         raise ValueError(f"unknown operation {operation}")
     # record the write, the oracle applies it in the serial replay:
-    record.data_operations.append(ExecutedDataOperation(operation))
+    record.data_operations.append(ExecutedDataOperation(operation, position=position))
     return str(operation)
 
 
@@ -459,10 +467,10 @@ def run_schedule(
     """Runs schedule on store and records what each transaction did.
 
     A transaction aborted by the store skips its remaining operations. If the store raises any other exception, the run
-    stops and the exception is recorded in error.
+    stops and the exception is recorded in error. Every transaction of the whole schedule gets a record, also one that
+    has not begun yet.
 
-    @param operation_count: run only the first operation_count operations; None runs all of them. Every transaction
-        of the whole schedule gets a record, also one that has not begun yet.
+    @param operation_count: run only the first operation_count operations; None runs all of them
     """
     # the transactions are numbered 0, 1, ..., so the largest index gives their number (none in an empty schedule):
     number_of_transactions: int = 1 + max(
@@ -473,7 +481,8 @@ def run_schedule(
         TransactionRecord(name=f"T{index + 1}")
         for index in range(number_of_transactions)
     ]
-    # one line per operation for the schedule table that is shown if the run violates serializability:
+    # one line per operation for the schedule table (shown by the playground, and by the tests if a run violates
+    # serializability):
     log: list[LogLine] = []
     position: int
     scheduled: ScheduledOperation
@@ -493,7 +502,10 @@ def run_schedule(
         try:
             # run the operation on the store and record its outcome (e.g. the result of a read) in record:
             log.append(
-                LogLine(transaction_index, execute_operation(store, record, operation))
+                LogLine(
+                    transaction_index,
+                    execute_operation(store, record, operation, position),
+                )
             )
         except TransactionAbortedException:
             # the store aborted the transaction, in a data operation or in its validation phase; this is
@@ -507,7 +519,7 @@ def run_schedule(
             log.append(LogLine(transaction_index, description))
             return ScheduleRun(records, {}, log, error=description)
 
-    # all operations ran: read the committed state, which the oracle compares with the serial replay:
+    # the operations ran without an error: read the committed state, which the oracle compares with the serial replay:
     return ScheduleRun(records, committed_state(store), log)
 
 
@@ -519,20 +531,54 @@ def serial_order(records: list[TransactionRecord]) -> list[TransactionRecord]:
     )
 
 
-def serializability_violation(
+@dataclass(frozen=True)
+class Difference:
+    """The first difference between a concurrent run and a serial replay: a read that returned something else, or,
+    if all reads match, the final state.
+    """
+
+    # the transaction and the read that differ, None if only the final state differs:
+    transaction: str | None
+    read: DataOperation | None
+    # the read's position in the schedule, None if only the final state differs or the read was not run from one:
+    position: int | None
+    # what the concurrent run gave (the read's result or the final state), and what the serial replay gives:
+    observed: ReadResult
+    serial: ReadResult
+
+    def description(self) -> str:
+        """Returns the difference as a sentence, e.g. ``T2: read a==1 returned {x: (a=1, b=0)}, in the serial order
+        it returns {}``.
+        """
+        if self.read is None:
+            return (
+                f"final state is {format_read_result(self.observed)}, "
+                f"in the serial order it is {format_read_result(self.serial)}"
+            )
+        return (
+            f"{self.transaction}: {self.read} returned {format_read_result(self.observed)}, "
+            f"in the serial order it returns {format_read_result(self.serial)}"
+        )
+
+
+def first_difference(
     initial_state: dict[str, Row],
     records: list[TransactionRecord],
     final_state: dict[str, Row],
     order: list[TransactionRecord] | None = None,
-) -> str | None:
-    """Replays the committed transactions serially and returns a description of the first difference, or None.
+) -> Difference | None:
+    """Replays the committed transactions serially and returns the first difference from the concurrent run, or None.
 
     The transactions are replayed one after another in the order of their serialization points, or in the given
     order. Every read in the replay must return what it returned in the concurrent run, and the final state must be
-    the same. This check is the oracle of the tests: it decides for every run whether the store behaved like this
-    serial order.
+    the same.
 
+    @param initial_state: the objects before the first operation
+    @param records: what each transaction did in the concurrent run
+    @param final_state: the committed objects after the concurrent run
     @param order: the committed transactions in the order to replay them; None for the serialization points
+    @return: the first read that returns something else in the replay, or the final state if only it differs; None
+        if the run behaved like this serial order
     """
     # the state of the serial replay, a plain dictionary from object id to object:
     state: dict[str, Row] = dict(initial_state)
@@ -548,9 +594,12 @@ def serializability_violation(
                 # a read always records its result:
                 assert executed.result is not None
                 if executed.result != expected:
-                    return (
-                        f"{record.name}: {data_operation} returned {format_read_result(executed.result)}, "
-                        f"in the serial order it returns {format_read_result(expected)}"
+                    return Difference(
+                        transaction=record.name,
+                        read=data_operation,
+                        position=executed.position,
+                        observed=executed.result,
+                        serial=expected,
                     )
             elif data_operation.kind == "update":
                 # an update inserts the object if it does not exist:
@@ -562,11 +611,31 @@ def serializability_violation(
                 raise ValueError(f"unknown data operation {data_operation}")
     # all reads matched; the store must end in the state of the serial replay as well:
     if state != final_state:
-        return (
-            f"final state is {format_read_result(evaluate_read(final_state, None))}, "
-            f"in the serial order it is {format_read_result(evaluate_read(state, None))}"
+        return Difference(
+            transaction=None,
+            read=None,
+            position=None,
+            observed=evaluate_read(final_state, None),
+            serial=evaluate_read(state, None),
         )
     return None
+
+
+def serializability_violation(
+    initial_state: dict[str, Row],
+    records: list[TransactionRecord],
+    final_state: dict[str, Row],
+    order: list[TransactionRecord] | None = None,
+) -> str | None:
+    """Replays the committed transactions serially and returns a description of the first difference, or None.
+
+    This check is the oracle of the tests: it decides for every run whether the store behaved like the serial order
+    (see :func:`first_difference`, which takes the same parameters).
+    """
+    difference: Difference | None = first_difference(
+        initial_state, records, final_state, order
+    )
+    return None if difference is None else difference.description()
 
 
 def format_schedule(run: ScheduleRun) -> str:
@@ -587,7 +656,7 @@ def format_schedule(run: ScheduleRun) -> str:
         lines.append(" " * (width * line.transaction_index) + line.text)
     # the order of the serial replay, with the serialization point that put each transaction there:
     order: str = ", ".join(
-        f"{record.name} ({'commit' if record.wrote else 'begin'} {record.serialization_point})"
+        f"{record.name} ({'commit' if record.wrote else 'begin'} ts {record.serialization_point})"
         for record in serial_order(run.records)
     )
     lines.append(f"\nserial order: {order or '(nothing committed)'}")

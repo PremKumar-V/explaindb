@@ -21,7 +21,7 @@
 """A playground for schedules on the MVCC store: run them operation by operation, show the store, judge the outcome.
 
 The model runs a schedule (see :mod:`system.playground.schedules`) on the real store and shows, after any operation,
-the versions in the store and what each transaction sees, read and wrote.
+the versions in the store and, for each transaction, its snapshot plus its own writes, what it read and what it wrote.
 """
 
 # The model reads the store's internals (versions, snapshots) on purpose, to show them.
@@ -30,30 +30,59 @@ the versions in the store and what each transaction sees, read and wrote.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 from system.playground.schedules import (
+    DataOperation,
+    Difference,
     LogLine,
+    Operation,
+    ReadResult,
     Row,
     Schedule,
     ScheduleRun,
     StoredObject,
     TransactionRecord,
+    first_difference,
+    format_read_result,
     run_schedule,
     serial_order,
-    serializability_violation,
 )
+from system.query_processing.predicates import WHERE_Clause
 from system.stores.MVCC import TransactionalKeyValueStore
 from system.stores.VersionedKeyValueStore import VersionedKeyValueStore
 
 # how the store validates a transaction at its commit:
 Mode = Literal["method 1", "method 2", "no validation"]
+# where a transaction is in its life:
+Status = Literal["not begun", "running", "committed", "aborted"]
 MODES: tuple[Mode, ...] = ("method 1", "method 2", "no validation")
+# the verdict shows the differences of at most this many serial orders (all of them for up to 3 transactions):
+MAX_ORDER_LINES: int = 6
 
 
 class StoreWithoutValidation(TransactionalKeyValueStore):
-    """A store that never validates: it gives snapshot isolation only, so anomalies such as write skew happen."""
+    """A store that never validates, so anomalies such as write skew happen.
+
+    Each transaction reads the snapshot of its begin plus its own writes. A write is stopped only while another
+    transaction holds an uncommitted version of the same object (see :meth:`TransactionalKeyValueStore.update_object`).
+    This is weaker than snapshot isolation, which also stops a write to an object that another transaction committed
+    after the writer's begin::
+
+        T1                          T2
+        begin
+                                    begin
+        read x
+                                    read x
+        update x
+        commit
+                                    update x -> passes here, aborts under snapshot isolation
+                                    commit   -> T1's update is lost
+
+    Write skew happens under both, as the two transactions write different objects.
+    """
 
     def _validate_transaction(
         self, TA_id: int, commit_timestamp_for_this_TA: int
@@ -82,10 +111,17 @@ def make_store(mode: Mode) -> TransactionalKeyValueStore:
 
 @dataclass(frozen=True)
 class Version:
-    """A committed version of an object: its commit timestamp and its value (None for a delete marker)."""
+    """A committed version of an object: its commit timestamp, its value (None for a delete marker) and who wrote it
+    (a transaction's name, or "initial" for an object in the store before the first transaction).
+    """
 
     commit_timestamp: int
     row: Row | None
+    writer: str
+
+    def __str__(self) -> str:
+        """Shows the version with its commit timestamp and its writer, e.g. ``ts 3 T1: (a=1, b=1)``."""
+        return f"ts {self.commit_timestamp} {self.writer}: {'deleted' if self.row is None else self.row}"
 
 
 @dataclass(frozen=True)
@@ -94,6 +130,10 @@ class WorkInProgress:
 
     owner: str
     row: Row | None
+
+    def __str__(self) -> str:
+        """Shows who is writing which version, e.g. ``T2: deleted``."""
+        return f"{self.owner}: {'deleted' if self.row is None else self.row}"
 
 
 @dataclass(frozen=True)
@@ -107,25 +147,42 @@ class ObjectState:
 
 
 @dataclass(frozen=True)
+class Checksum:
+    """Validation method 1's check of one read: the checksum of its result when it ran, and the checksum the same read
+    gives if the transaction commits now (None once the transaction has committed). They differ if a transaction
+    that committed meanwhile changed what the read returns; then the transaction aborts at its commit, unless it
+    wrote nothing (the store does not validate such a transaction).
+    """
+
+    clause: str
+    at_read: str
+    now: str | None
+
+
+@dataclass(frozen=True)
 class TransactionState:
     """What one transaction did so far and what it sees."""
 
     name: str
     # the transaction id the store gave it at its begin, None before its begin:
     TA_id: int | None
-    status: Literal["not begun", "running", "committed", "aborted"]
+    status: Status
     # what a read of all objects returns for the transaction (its snapshot plus its own writes); empty unless running:
     sees: tuple[StoredObject, ...]
     # the where clauses of its reads, e.g. a==1 or all, and the ids of the objects it wrote, each once and sorted
     # (an aborted transaction keeps them, so that one can see what it did):
     read_clauses: tuple[str, ...]
     write_set: tuple[str, ...]
+    # validation method 1 only, one per where clause: empty in the other modes and once aborted (the store forgets
+    # an aborted transaction):
+    checksums: tuple[Checksum, ...] = ()
 
 
 @dataclass(frozen=True)
 class Verdict:
     """The judgement of a run, as a kind and as a sentence: pending, error, nothing committed, or whether the
-    committed transactions behaved like some serial order."""
+    committed transactions behaved like some serial order.
+    """
 
     kind: Literal[
         "pending",
@@ -135,7 +192,17 @@ class Verdict:
         "serializable in another order",
         "not serializable",
     ]
+    # the verdict in one sentence:
     text: str
+    # unless the order of the serialization points matches: one line per serial order replayed, with its first
+    # difference or that it matches (at most MAX_ORDER_LINES differences, then a line that counts the others); the
+    # first line is the one of the order of the serialization points:
+    details: tuple[str, ...] = ()
+    # the position in the schedule of the read that returns something else in the order of the serialization points,
+    # to mark it in the schedule (details[0] says what it would return there); None if no read differs there:
+    marked_position: int | None = None
+    # what the marked read would return in the order of the serialization points, shown next to it in the schedule:
+    marked_explanation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,14 +214,18 @@ class RunState:
     # the schedule table's lines, one per operation run (also a skipped one and, after an error, the one that failed):
     log: tuple[LogLine, ...]
     verdict: Verdict
+    # why an operation went wrong, by its position in the schedule: why the store aborted a transaction there, or
+    # what the marked read would return in the order of the serialization points (see Verdict.marked_position):
+    explanations: dict[int, str]
 
 
 def object_states(
-    store: TransactionalKeyValueStore, names: dict[int, str]
+    store: TransactionalKeyValueStore, names: dict[int, str], writers: dict[int, str]
 ) -> tuple[ObjectState, ...]:
     """Returns the versions of every object in the store, sorted by object id.
 
     @param names: the names of the transactions (T1, T2, ...) by their transaction id
+    @param writers: the names of the committed transactions by their commit timestamp
     """
     states: list[ObjectState] = []
     # sorted, so that the objects appear in the same order in every run:
@@ -170,6 +241,8 @@ def object_states(
                     if isinstance(version, VersionedKeyValueStore.DeleteEntry)
                     else version.value
                 ),
+                # the initial objects are put at timestamp 0, before any transaction:
+                writers.get(version.start_validity, "initial"),
             )
             for version in entry.committed
         )
@@ -189,6 +262,51 @@ def object_states(
     return tuple(states)
 
 
+def format_where(a_equals: int | None) -> str:
+    """Writes a read's where clause as the transactions' read clauses show it: ``all`` or e.g. ``a==1``.
+
+    @param a_equals: the constant the read compares a with, None for a read of all objects
+    """
+    return "all" if a_equals is None else f"a=={a_equals}"
+
+
+def checksums(
+    store: TransactionalKeyValueStore,
+    TA_id: int,
+    status: Status,
+) -> tuple[Checksum, ...]:
+    """Returns validation method 1's checksums of the reads of transaction ``TA_id``, sorted by where clause.
+
+    @param status: the transaction's status; only a running one gets the checksum it would get now
+    @return: empty in the other modes and for an aborted transaction
+    """
+    # the store keeps a transaction's read set until it aborts; only method 1 computes checksums:
+    entry: TransactionalKeyValueStore.TDEntry | None = store.TD.get(TA_id)
+    if entry is None or not store.use_brute_force_validation:
+        return ()
+    found: set[Checksum] = set()
+    for read_clause in entry.read_clauses:
+        now: str | None = None
+        if status == "running":
+            # the read again on the state a commit now would validate against: the next value of the store's counter
+            # becomes the commit timestamp (as in TransactionalKeyValueStore.commit_transaction); [1]: the checksum:
+            now = store._read_snapshot(store.TA_id, read_clause["where_clause"])[1]
+        # a read that ran twice is in the read set twice, with the same checksum; the set keeps it once:
+        found.add(
+            Checksum(
+                # the playground's reads compare a with a constant (see execute_operation):
+                format_where(
+                    None
+                    if read_clause["where_clause"] is None
+                    else cast(int, read_clause["where_clause"].constant)
+                ),
+                read_clause["checksum"],
+                now,
+            )
+        )
+    return tuple(sorted(found, key=lambda checksum: checksum.clause))
+
+
 def transaction_states(
     store: TransactionalKeyValueStore, records: list[TransactionRecord]
 ) -> tuple[TransactionState, ...]:
@@ -199,7 +317,7 @@ def transaction_states(
         if record.TA_id is None:
             states.append(TransactionState(record.name, None, "not begun", (), (), ()))
             continue
-        status: Literal["running", "committed", "aborted"]
+        status: Status
         if record.committed:
             status = "committed"
         elif record.aborted:
@@ -211,11 +329,7 @@ def transaction_states(
         read_clauses: tuple[str, ...] = tuple(
             sorted(
                 {
-                    (
-                        "all"
-                        if done.data_operation.a_equals is None
-                        else f"a=={done.data_operation.a_equals}"
-                    )
+                    format_where(done.data_operation.a_equals)
                     for done in record.data_operations
                     if done.data_operation.kind == "read"
                 }
@@ -240,7 +354,13 @@ def transaction_states(
             )
         states.append(
             TransactionState(
-                record.name, record.TA_id, status, sees, read_clauses, write_set
+                record.name,
+                record.TA_id,
+                status,
+                sees,
+                read_clauses,
+                write_set,
+                checksums(store, record.TA_id, status),
             )
         )
     return tuple(states)
@@ -248,6 +368,56 @@ def transaction_states(
 
 # ---------------------------------------------------------------------------------------------------------------
 # judging
+
+
+def order_names(order: Sequence[TransactionRecord]) -> str:
+    """Returns a serial order as the verdict writes it, e.g. ``T1|T3|T2``."""
+    return "|".join(record.name for record in order)
+
+
+def order_line(
+    order: Sequence[TransactionRecord], difference: Difference | None
+) -> str:
+    """Returns the line of the verdict for one serial order.
+
+    E.g. ``Order T1|T2: T2's read a==1 would return {x: (a=1, b=100)}, but returned {x: (a=1, b=0)}.``
+
+    @param order: the committed transactions in the order they were replayed
+    @param difference: the first difference of the replay in this order, None if it matches
+    @return: the line, a sentence
+    """
+    names: str = order_names(order)
+    if difference is None:
+        return f"Order {names}: same read results and final state."
+    if difference.read is None:
+        return (
+            f"Order {names}: the final state would be {format_read_result(difference.serial)}, "
+            f"but is {format_read_result(difference.observed)}."
+        )
+    return (
+        f"Order {names}: {difference.transaction}'s {difference.read} would return "
+        f"{format_read_result(difference.serial)}, but returned {format_read_result(difference.observed)}."
+    )
+
+
+def more_orders(lines: list[str], differing_orders: int) -> list[str]:
+    """Returns the lines of the orders that differ, followed by a line that counts the orders not shown, if any,
+    e.g. ``… and 18 more orders that differ.``
+
+    @param lines: the lines of the first orders that differ, at most :data:`MAX_ORDER_LINES`
+    @param differing_orders: how many orders differ in all
+    @return: the lines, and the counting line if some orders are not shown
+    """
+    hidden: int = differing_orders - len(lines)
+    if hidden == 0:
+        return lines
+    return lines + [
+        (
+            "… and 1 more order that differs."
+            if hidden == 1
+            else f"… and {hidden} more orders that differ."
+        )
+    ]
 
 
 def serializability_verdict(
@@ -259,47 +429,197 @@ def serializability_verdict(
 
     Compares the read results and the final state with a serial replay, first in the order of the serialization
     points (the commit timestamp of a transaction that wrote, the begin of a read-only one), then in every other
-    order of the committed transactions (n! orders for n committed transactions).
+    order of the committed transactions (n! orders for n committed transactions), until one matches.
+
+    @param initial_state: the objects before the first operation
+    @param records: what each transaction did in the run, every one of them committed or aborted
+    @param final_state: the committed objects after the run
+    @return: the verdict; unless the order of the serialization points matches, with one line per order replayed
+        and, if a read differs in the order of the serialization points, its position in the schedule (also when
+        another order matches)
     """
     # the committed transactions in the order of their serialization points (aborted ones had no effect):
     committed: list[TransactionRecord] = serial_order(records)
     if not committed:
         return Verdict("nothing committed", "Nothing committed.")
-    order_text: str = ", ".join(record.name for record in committed)
     # first the order of the serialization points, the order validation methods 1 and 2 aim for:
-    violation_in_serialization_order: str | None = serializability_violation(
+    difference: Difference | None = first_difference(
         initial_state, records, final_state
     )
-    if violation_in_serialization_order is None:
+    if difference is None:
         return Verdict(
             "serializable",
-            f"Same read results and final state as the serial order {order_text}: serializable.",
+            "Serializable: same read results and final state as the serial order "
+            f"{order_names(committed)}.",
         )
+    marked_position: int | None = difference.position
+    marked_explanation: str | None = (
+        None
+        if difference.read is None
+        else f"in the order {order_names(committed)} this read would return "
+        f"{format_read_result(difference.serial)}"
+    )
+    # the lines of the orders that differ, starting with the order of the serialization points:
+    lines: list[str] = [order_line(committed, difference)]
+    differing_orders: int = 1
     # otherwise the schedule may still be serializable in some other order:
     for order in itertools.permutations(committed):
         # the order of the serialization points was already replayed above:
         if list(order) == committed:
             continue
-        if (
-            serializability_violation(initial_state, records, final_state, list(order))
-            is None
-        ):
+        difference = first_difference(initial_state, records, final_state, list(order))
+        if difference is None:
             return Verdict(
                 "serializable in another order",
-                f"Not like the order {order_text} ({violation_in_serialization_order}), but the same read results "
-                f"and final state as the serial order {', '.join(record.name for record in order)}: "
-                "serializable.",
+                "Serializable, but not in the order of the serialization points.",
+                tuple(more_orders(lines, differing_orders) + [order_line(order, None)]),
+                marked_position,
+                marked_explanation,
             )
+        differing_orders += 1
+        if len(lines) < MAX_ORDER_LINES:
+            lines.append(order_line(order, difference))
     # no serial order explains what the transactions read and what the store holds at the end:
     return Verdict(
         "not serializable",
-        f"No serial order gives the same read results and final state ({order_text}: "
-        f"{violation_in_serialization_order}): not serializable.",
+        "Not serializable: no serial order gives the same read results and final state.",
+        tuple(more_orders(lines, differing_orders)),
+        marked_position,
+        marked_explanation,
     )
 
 
 # ---------------------------------------------------------------------------------------------------------------
 # running
+
+
+def fresh_store(
+    mode: Mode, initial_state: tuple[StoredObject, ...]
+) -> TransactionalKeyValueStore:
+    """Returns a new store for ``mode`` that holds the initial objects as committed versions with timestamp 0."""
+    store: TransactionalKeyValueStore = make_store(mode)
+    # put writes the initial objects as committed versions with timestamp 0, before any transaction:
+    for stored in initial_state:
+        store.put(stored.object_id, stored.row)
+    return store
+
+
+def returned_by(where: WHERE_Clause | None, row: Row | None) -> bool:
+    """Returns True if a read with the where clause ``where`` (None: all objects) returns the object ``row`` (None: the
+    object does not exist), as in validation method 2 of the store."""
+    return row is not None and (where is None or where.evaluate(row))
+
+
+def snapshot_read(
+    store: TransactionalKeyValueStore, timestamp: int, where: WHERE_Clause | None
+) -> ReadResult:
+    """Returns what a read with ``where`` returns from the committed versions visible at ``timestamp``, without any
+    work-in-progress version, sorted by object id."""
+    # [0]: the (object_id, object)-pairs, without the checksum:
+    pairs: list[tuple[str, Row]] = store._read_snapshot(
+        timestamp, where, ignore_wip=True
+    )[0]
+    return tuple(
+        sorted(
+            (StoredObject(object_id, row) for object_id, row in pairs),
+            key=lambda stored: stored.object_id,
+        )
+    )
+
+
+def abort_explanation(
+    schedule: Schedule,
+    initial_state: tuple[StoredObject, ...],
+    mode: Mode,
+    position: int,
+) -> str:
+    """Explains why the store aborted the transaction of the operation at ``position`` of ``schedule``.
+
+    The schedule runs again up to just before that operation; then the store's state is checked the way the store
+    decided: a write fails while another transaction holds an uncommitted version of the object, a commit fails if
+    the validation finds that a read changed (method 1: the read run again at the commit timestamp returns something
+    different from what it returns in the snapshot of the transaction's begin; method 2: another transaction that
+    committed after this one began changed an object the read returns in that snapshot or returns now). Like the store,
+    both checks leave out the transaction's own writes.
+
+    @param schedule: the schedule, as for :func:`run_to`
+    @param initial_state: the objects in the store before the first operation
+    @param mode: how the store validates
+    @param position: the position of an operation at which the store aborted its transaction
+    @return: e.g. ``T1 is writing x and has not committed yet`` or ``validation: read a==1 now returns {}, but in
+        the snapshot of T2's begin it returns {x: (a=1, b=0)}``
+    """
+    store: TransactionalKeyValueStore = fresh_store(mode, initial_state)
+    run: ScheduleRun = run_schedule(store, schedule, position)
+    transaction_index: int = schedule[position].transaction_index
+    operation: Operation = schedule[position].operation
+    record: TransactionRecord = run.records[transaction_index]
+    if operation != "commit":
+        # an update or a delete: another transaction holds a work-in-progress version of the object:
+        key: str = cast(DataOperation, operation).key
+        writer_id: int = store.key_value_store[key].wip.start_validity
+        writer: str = next(
+            other.name for other in run.records if other.TA_id == writer_id
+        )
+        return f"{writer} is writing {key} and has not committed yet"
+    assert record.TA_id is not None
+    # the commit timestamp the commit gets: the next value of the store's counter (see commit_transaction):
+    commit_timestamp: int = store.TA_id
+    # the objects written by the transactions that committed after the transaction began (method 2 checks them):
+    written_meanwhile: list[str] = sorted(
+        {
+            written.data_operation.key
+            for other in run.records
+            if other.commit_timestamp is not None
+            and other.commit_timestamp > record.TA_id
+            for written in other.data_operations
+            if written.data_operation.kind != "read"
+        }
+    )
+    for executed in record.data_operations:
+        read: DataOperation = executed.data_operation
+        if read.kind != "read":
+            continue
+        where: WHERE_Clause | None = (
+            None if read.a_equals is None else WHERE_Clause("a", "==", read.a_equals)
+        )
+        if store.use_brute_force_validation:
+            # method 1 compares the read's result in the committed snapshot of the begin (without the transaction's
+            # own writes, as the checksum at the read) with its result at the commit timestamp:
+            in_snapshot: ReadResult = snapshot_read(store, record.TA_id, where)
+            now: ReadResult = snapshot_read(store, commit_timestamp, where)
+            if now != in_snapshot:
+                return (
+                    f"validation: {read} now returns {format_read_result(now)}, "
+                    f"but in the snapshot of {record.name}'s begin it returns {format_read_result(in_snapshot)}"
+                )
+            continue
+        # method 2 checks the objects written by the transactions that committed after the transaction began:
+        for key in written_meanwhile:
+            before: Row | None = store._get_visible_object_version(
+                key, record.TA_id, ignore_wip=True
+            )
+            after: Row | None = store._get_visible_object_version(
+                key, commit_timestamp, ignore_wip=True
+            )
+            if before == after:
+                continue
+            # the transaction whose version of the object is committed now (its commit timestamp is the version's):
+            writer = next(
+                other.name
+                for other in run.records
+                if other.commit_timestamp
+                == store.key_value_store[key].committed[-1].start_validity
+            )
+            if returned_by(where, before):
+                return (
+                    f"validation: {writer} changed {key}, which {read} returns in the snapshot of "
+                    f"{record.name}'s begin"
+                )
+            if returned_by(where, after):
+                return f"validation: {writer} changed {key}, which {read} returns now"
+    # the store aborted the commit, so one of the checks above, which follow the store's validation, found the reason:
+    raise AssertionError(f"no reason found for the abort at position {position}")
 
 
 def run_to(
@@ -322,10 +642,7 @@ def run_to(
     @return: the state after the operations, with the verdict ("pending" until every transaction has ended, "error"
         if the store raised an error other than an abort, e.g. a KeyError for a delete of an object it does not have)
     """
-    store: TransactionalKeyValueStore = make_store(mode)
-    # put writes the initial objects as committed versions with timestamp 0, before any transaction:
-    for stored in initial_state:
-        store.put(stored.object_id, stored.row)
+    store: TransactionalKeyValueStore = fresh_store(mode, initial_state)
     run: ScheduleRun = run_schedule(store, schedule, operation_count)
     # the verdict is only meaningful once every transaction has ended; an empty schedule stays pending:
     verdict: Verdict = Verdict("pending", "Pending: not every transaction has ended.")
@@ -340,13 +657,29 @@ def run_to(
             run.records,
             run.final_state,
         )
-    # the names of the transactions by the id the store gave them, to name the writer of a version:
+    # the names of the transactions by the id the store gave them and by their commit timestamp, to name the writer
+    # of a work-in-progress and of a committed version:
     names: dict[int, str] = {
         record.TA_id: record.name for record in run.records if record.TA_id is not None
     }
+    writers: dict[int, str] = {
+        record.commit_timestamp: record.name
+        for record in run.records
+        if record.commit_timestamp is not None
+    }
+    # why the store aborted a transaction, at each such operation (the log marks them, see run_schedule), and what
+    # the marked read would return in the order of the serialization points:
+    explanations: dict[int, str] = {
+        position: abort_explanation(schedule, initial_state, mode, position)
+        for position, line in enumerate(run.log)
+        if line.text.endswith(": aborted")
+    }
+    if verdict.marked_position is not None and verdict.marked_explanation is not None:
+        explanations[verdict.marked_position] = verdict.marked_explanation
     return RunState(
-        objects=object_states(store, names),
+        objects=object_states(store, names, writers),
         transactions=transaction_states(store, run.records),
         log=tuple(run.log),
         verdict=verdict,
+        explanations=explanations,
     )

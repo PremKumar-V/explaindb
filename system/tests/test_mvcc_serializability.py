@@ -35,10 +35,12 @@ from typing import cast
 from system.playground.mvcc_playground import StoreWithoutValidation
 from system.playground.schedules import (
     DataOperation,
+    Difference,
     ExecutedDataOperation,
     Row,
     Schedule,
     ScheduleCheck,
+    ScheduleRun,
     ScheduleSpace,
     ScheduledOperation,
     StoredObject,
@@ -46,8 +48,10 @@ from system.playground.schedules import (
     TransactionRecord,
     all_transactions,
     check_all_schedules,
+    first_difference,
     number_of_schedules,
     overlapping_committed_writers,
+    run_schedule,
     schedules,
     serializability_violation,
     two_commits_during_writer,
@@ -394,9 +398,9 @@ class SerializabilityTest(ExhaustiveTestCase):
         T1                          T2
         begin
                                     begin
-        read a==1 -> {x}
-                                    read a==1 -> {x}
-        update y=Row(1,0)
+        read a==1 → {x}
+                                    read a==1 → {x}
+        update y ← (a=1, b=0)
                                     delete x
         commit
                                     commit
@@ -439,11 +443,11 @@ class SerializabilityTest(ExhaustiveTestCase):
         ```text
         T1                          T2
         begin
-        read a==1 -> {x}
-        update y=Row(1,0)
+        read a==1 → {x}
+        update y ← (a=1, b=0)
         commit
                                     begin
-                                    read a==1 -> {x, y}
+                                    read a==1 → {x, y}
                                     delete x
                                     commit
         ```
@@ -487,9 +491,9 @@ class SerializabilityTest(ExhaustiveTestCase):
         T1                          T2
         begin
                                     begin
-                                    update x=Row(0,0)
+                                    update x ← (a=0, b=0)
                                     commit
-        read a==1 -> {x}
+        read a==1 → {x}
         commit
         ```
         """
@@ -519,7 +523,12 @@ class SerializabilityTest(ExhaustiveTestCase):
         )
 
     def test_oracle_rejects_wrong_final_state(self) -> None:
-        """The oracle rejects a final state that lacks the update of the only committed transaction."""
+        """The oracle rejects a final state that lacks the update of the only committed transaction: the difference
+        names no read and holds the final state of the run as observed and that of the serial replay as serial.
+
+        Would fail if the wrong final state were accepted, the two final states were swapped, or a read were named
+        although every read matches.
+        """
         x: Row = Row(1, 0)
         t_1: TransactionRecord = TransactionRecord(
             name="T1",
@@ -530,9 +539,20 @@ class SerializabilityTest(ExhaustiveTestCase):
             committed=True,
             commit_timestamp=2,
         )
-        violation: str | None = serializability_violation({"x": x}, [t_1], {"x": x})
-        self.assertIsNotNone(violation)
-        self.assertIn("final state", violation)
+        self.assertEqual(
+            Difference(
+                transaction=None,
+                read=None,
+                position=None,
+                observed=(StoredObject("x", x),),
+                serial=(StoredObject("x", Row(0, 0)),),
+            ),
+            first_difference({"x": x}, [t_1], {"x": x}),
+        )
+        self.assertEqual(
+            "final state is {x: (a=1, b=0)}, in the serial order it is {x: (a=0, b=0)}",
+            serializability_violation({"x": x}, [t_1], {"x": x}),
+        )
 
 
 class OracleThreeTransactionsTest(unittest.TestCase):
@@ -547,16 +567,19 @@ class OracleThreeTransactionsTest(unittest.TestCase):
         ```text
         T1                     T2                          T3
         begin
-        update y=Row(1,0)
+        update y ← (a=1, b=0)
         commit
                                begin
                                                            begin
-                               read all -> {x, y, z}
-                               update x=Row(0,0)
-                                                           read all -> {x, z}
+                               read all → {x, y, z}
+                               update x ← (a=0, b=0)
+                                                           read all → {x, z}
                                                            commit
                                commit
         ```
+
+        Would fail if the violation named another transaction or read, or swapped what the read returned and what
+        it returns in the serial order.
         """
         x: Row = Row(1, 0)
         y: Row = Row(1, 0)
@@ -596,8 +619,55 @@ class OracleThreeTransactionsTest(unittest.TestCase):
         violation: str | None = serializability_violation(
             {"x": x, "z": z}, [t_1, t_2, t_3], {"x": Row(0, 0), "y": y, "z": z}
         )
-        self.assertIsNotNone(violation)
-        self.assertIn("T3: read all", violation)
+        self.assertEqual(
+            "T3: read all returned {x: (a=1, b=0), z: (a=0, b=0)}, in the serial order it returns "
+            "{x: (a=1, b=0), y: (a=1, b=0), z: (a=0, b=0)}",
+            violation,
+        )
+
+    def test_difference_of_a_run_has_the_read_s_position(self) -> None:
+        """In a run of write skew via phantom on the store without validation, the first difference is T2's read
+        a==1, with its position 3 in the schedule, what it returned and what it returns in the serial order T1, T2.
+
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read a==1 → {x}
+                                    read a==1 → {x}    <- position 3
+        update y ← (a=1, b=0)
+                                    delete x
+        commit
+                                    commit
+        ```
+
+        Would fail if run_schedule did not record a read's position in the schedule, or first_difference did not
+        pass it on, so that the playground marked another operation.
+        """
+        x: Row = Row(1, 0)
+        schedule: Schedule = (
+            ScheduledOperation(0, "begin"),
+            ScheduledOperation(1, "begin"),
+            ScheduledOperation(0, DataOperation("read", a_equals=1)),
+            ScheduledOperation(1, DataOperation("read", a_equals=1)),
+            ScheduledOperation(0, DataOperation("update", "y", Row(1, 0))),
+            ScheduledOperation(1, DataOperation("delete", "x")),
+            ScheduledOperation(0, "commit"),
+            ScheduledOperation(1, "commit"),
+        )
+        store: StoreWithoutValidation = StoreWithoutValidation()
+        store.put("x", x)
+        run: ScheduleRun = run_schedule(store, schedule)
+        self.assertEqual(
+            Difference(
+                transaction="T2",
+                read=DataOperation("read", a_equals=1),
+                position=3,
+                observed=(StoredObject("x", x),),
+                serial=(StoredObject("x", x), StoredObject("y", Row(1, 0))),
+            ),
+            first_difference({"x": x}, run.records, run.final_state),
+        )
 
     def test_store_without_validation_is_caught_with_three_transactions(self) -> None:
         """A store that skips validation is caught in a small three-transaction space.

@@ -20,7 +20,7 @@
 
 """Scenarios for the MVCC playground: classic schedules that show how the store prevents (or allows) anomalies.
 
-The anomaly names (lost update, write skew, phantom insert, concurrent delete) follow the tests in
+The anomaly names lost update, write skew, phantom insert and concurrent delete follow the tests in
 ``system/tests/test_store_anomalies.py``.
 """
 
@@ -111,7 +111,25 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
     make_scenario(
         "write skew",
-        "Each transaction writes into what the other one read: T1 inserts y into a==1, T2 deletes x.",
+        "Both transactions read x and y; each then updates a different one, based on what it read.",
+        {"x": Row(1, 0), "y": Row(2, 0)},
+        [
+            (1, "begin"),
+            (2, "begin"),
+            (1, DataOperation("read", a_equals=1)),
+            (1, DataOperation("read", a_equals=2)),
+            (2, DataOperation("read", a_equals=1)),
+            (2, DataOperation("read", a_equals=2)),
+            (1, DataOperation("update", "x", Row(1, 100))),
+            (2, DataOperation("update", "y", Row(2, 200))),
+            (1, "commit"),
+            (2, "commit"),
+        ],
+    ),
+    make_scenario(
+        "write skew via phantom (insert and delete)",
+        "Each transaction writes into what the other one read, through the predicate a==1: T1 inserts y into it, "
+        "T2 deletes x from it.",
         {"x": Row(1, 0)},
         [
             (1, "begin"),
