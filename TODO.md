@@ -17,3 +17,10 @@ per 0-fill word; see the regression test `test_iterating_sparse_wah_does_not_ove
 _None currently._ Both earlier items were resolved by the migration to uv: black is pinned via
 `pyproject.toml` / `uv.lock` and run with `uv run black`, and the pipenv caching limitation no longer
 applies because uv installs into the project's own `.venv/`.
+
+## Follow-ups waiting for other changes
+
+- **MVCC playground and issue #53** (a delete of an object that is not visible to the transaction raises
+  `KeyError`): once #53 is merged, revisit the error verdict of `run_to` in `system/playground/mvcc_playground.py`
+  and its test, and the serial-replay oracle and schedule spaces of the serializability test, which replay a delete
+  of an absent object as a no-op.

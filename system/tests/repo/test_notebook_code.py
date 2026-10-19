@@ -37,7 +37,7 @@ from pathlib import Path
 from types import ModuleType
 
 # Anchored to this test file so discovery works regardless of the caller's cwd.
-REPO_ROOT: Path = Path(__file__).resolve().parents[2]
+REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 SCRIPT_PATH: Path = REPO_ROOT / ".ci" / "notebook_code.py"
 
 

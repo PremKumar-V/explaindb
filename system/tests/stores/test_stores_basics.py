@@ -76,7 +76,15 @@ class StoreTestBasics(AbstractUnitTest):
         self.assertIsInstance(tkvs.committed_transactions_trace, list)
 
     def test_begin_transaction(self):
-        """Test begin_transaction method"""
+        """`begin_transaction` adds the TA to the transaction dictionary with a read clause set, a write set and no
+        commit timestamp. It also stores the position in the commit trace of the last TA that had committed when it
+        began (-1 if none); this position does not change when the TA itself commits while a second TA runs.
+
+        TA 1                                TA 2
+        begin
+                                            begin
+        commit
+        """
         tkvs = TransactionalKeyValueStore()
         TA_ID: int = tkvs.begin_transaction()
 
@@ -95,7 +103,18 @@ class StoreTestBasics(AbstractUnitTest):
         self.assertEqual(TD_entry.last_committed_TA_index_in_TA_trace, -1)
 
     def test_journaling(self):
-        """Test journaling/logging of transactions, test creation of appropriate journal/log entries"""
+        """The journal holds one list of entries per TA: `Begin` at the start, then `Update` and `Delete` for its
+        writes, and `Commit` with the commit timestamp or `Abort` at the end.
+
+        TA 1                                TA 2
+        begin
+                                            begin
+        commit (timestamp 3)
+                                            update "a" to "b"
+                                            update "b" to "c"
+                                            delete "b"
+                                            abort
+        """
 
         tkvs = TransactionalKeyValueStore()
         TA_ID: int = tkvs.begin_transaction()

@@ -19,7 +19,8 @@ enumeration algorithms need.
   [`system/query_optimization/problems.py`](../../../system/query_optimization/problems.py) (the bit-set
   `Problem` and its subset enumeration).
 - **Notebook:** [`PlanEnumeration.ipynb`](../../../notebooks/PlanEnumeration.ipynb).
-- **Tests:** [`system/tests/test_plan_enumeration.py`](../../../system/tests/test_plan_enumeration.py).
+- **Tests:**
+  [`system/tests/query_optimization/test_plan_enumeration.py`](../../../system/tests/query_optimization/test_plan_enumeration.py).
 
 ## The idea in one picture
 

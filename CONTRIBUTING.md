@@ -6,6 +6,19 @@ All Python code is formatted with [black](https://black.readthedocs.io) using it
 default settings. The CI pipeline runs `black --check .` and rejects unformatted
 code, so run `black .` before every push.
 
+## Tests
+
+The unit tests live in `system/tests/`, whose folders mirror the packages of `system/`: the tests of
+`system/stores/` are in `system/tests/stores/`, and the tests of modules directly in `system/` (e.g.
+`system/sorting.py`) are directly in `system/tests/`. Tests that check the repository itself (CI configuration,
+notebooks and the README, the Javadoc hook of the API documentation in `docs/api/javadoc.py`) are in
+`system/tests/repo/`. Every test folder below `system/tests/` needs an `__init__.py`; without it,
+`unittest discover` silently skips its tests. Run all tests with:
+
+```sh
+uv run python -m unittest discover system/tests/
+```
+
 ## Dependencies
 
 Dependencies are managed with [uv](https://docs.astral.sh/uv/) in `pyproject.toml`
@@ -149,15 +162,15 @@ uv tool run --from semgrep==1.173.0 semgrep scan --metrics=off --config p/securi
 The notebooks live in `notebooks/`. When you add, rename or remove one, also update:
 
 - the notebook table in the README (section *Notebooks*): one row with the link, a
-  one-line topic and the Binder badge. `system/tests/test_readme_notebooks.py` fails if
+  one-line topic and the Binder badge. `system/tests/repo/test_readme_notebooks.py` fails if
   the table and `notebooks/` disagree.
 - `.ci/notebook_weights.tsv` (the notebook's run time, used to balance the parallel CI
   jobs) and the expected packing and notebook count in
-  `system/tests/test_assign_notebooks.py`, which fails otherwise.
+  `system/tests/repo/test_assign_notebooks.py`, which fails otherwise.
 
 ## Serializability test of the MVCC store
 
-`system/tests/test_mvcc_serializability.py` runs every schedule of a *schedule space*: a set of
+`system/tests/stores/test_mvcc_serializability.py` runs every schedule of a *schedule space*: a set of
 schedules given by the initial state, the data operations, how many of them each transaction runs,
 and how the transactions end. The regular test job runs every schedule of two short transactions
 (one or two data operations each).
@@ -167,11 +180,11 @@ hour locally (about two hours on CI). They run in the job `serializability_night
 scheduled pipeline on main; in a merge request the job can be started by hand. Only this job and
 `dependency_audit` run in scheduled pipelines: every new CI job must extend
 `.not_in_scheduled_pipelines` (or start its own rules with the same `schedule`/`never` rule), which
-`system/tests/test_ci_config.py` checks. A job meant for scheduled pipelines is added to `SCHEDULED_JOBS`
+`system/tests/repo/test_ci_config.py` checks. A job meant for scheduled pipelines is added to `SCHEDULED_JOBS`
 in that test instead. To run the larger spaces locally:
 
 ```sh
-EXPLAINDB_NIGHTLY=1 uv run python -m unittest -v system.tests.test_mvcc_serializability.NightlySerializabilityTest
+EXPLAINDB_NIGHTLY=1 uv run python -m unittest -v system.tests.stores.test_mvcc_serializability.NightlySerializabilityTest
 ```
 
 ## API documentation

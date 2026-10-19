@@ -31,7 +31,9 @@ from unittest import mock
 # ``docs/api`` is not a package, so it is added to ``sys.path`` to import the
 # hook module directly (mirrors how the Sphinx conf.py loads it).
 _DOCS_API = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ),
     "docs",
     "api",
 )

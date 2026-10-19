@@ -30,14 +30,14 @@ from system.indexes.christmas_tree import ChristmasTree
 from system.indexes.indexes import (
     PythonDictionaryIndex,
 )
-from system.indexes.radix_trie import RadixTrie, KeyMapping
+from system.indexes.radix_trie import RadixTrie, PrefixDigitMapping
 from system.query_processing.predicates import TrueClause, WHERE_Clause
 from system.stores.IndexedMVCC import IndexedTransactionalKeyValueStore
 from system.stores.MVCC import TransactionAbortedException
 from faker import Faker
 
 from system.tests.abstract_unit_test import AbstractUnitTest
-from system.utils import Triangle, Vector, Descriptor
+from system.utils import Triangle, Vector
 
 Faker.seed(42)
 
@@ -129,6 +129,18 @@ class IndexingTest(AbstractUnitTest):
         self.assertEqual(index_entry_b.index.size(), no_unique_keys_on_b)
 
     def test_index_maintenance_transactional_store_commits(self):
+        """The indexes hold every object version: an update adds its new version at once, a delete and the commit
+        change nothing.
+
+        t1
+        begin
+        update "1" to (3, 4)
+        delete "2"
+        commit
+
+        Before t1 begins, the store holds "1"=(2, 3) and "2"=(4, 3) with equality indexes on a and b; the test first
+        checks which indexes get_suitable_indexes offers.
+        """
         store = IndexedTransactionalKeyValueStore()
 
         store.put("1", IndexingTest.Stuff(2, 3))
@@ -192,6 +204,15 @@ class IndexingTest(AbstractUnitTest):
         check_indexes(self, store)
 
     def test_index_maintenance_transactional_store_aborts(self):
+        """Aborting a transaction removes the version added by its update from the indexes.
+
+        t1
+        begin
+        update "1" to (3, 4)
+        abort
+
+        Before t1 begins, the store holds "1"=(2, 3) with equality indexes on a and b.
+        """
         store = IndexedTransactionalKeyValueStore()
 
         store.put("1", IndexingTest.Stuff(2, 3))
@@ -215,7 +236,18 @@ class IndexingTest(AbstractUnitTest):
         self.assertEqual(list(store.indexes_by_name["b_idx"].index.get(3)), ["1"])
 
     def test_index_maintenance_transactional_store_double_delete(self):
-        """A transaction may delete an object twice and commit; the index keeps the committed version."""
+        """A transaction may delete an object twice and commit; the index keeps the committed version.
+
+        t1                          t2
+        begin
+        delete "1"
+        delete "1"
+        commit
+                                    begin
+                                    read all -> sees nothing
+
+        Before t1 begins, the store holds "1"=(2, 3) with an equality index on a.
+        """
         store = IndexedTransactionalKeyValueStore()
         store.put("1", IndexingTest.Stuff(2, 3))
         store.create_index("a_idx", "a", "=")
@@ -236,7 +268,14 @@ class IndexingTest(AbstractUnitTest):
     def test_index_maintenance_transactional_store_delete_then_update(self):
         """A transaction may update an object it deleted before.
 
-        The new version is indexed next to the committed one; the delete marker adds nothing.
+        t1
+        begin
+        delete "1"
+        update "1" to (5, 5)
+        read all -> sees (5, 5)
+
+        Before t1 begins, the store holds "1"=(2, 3) with an equality index on a. The new version is indexed next to
+        the committed one; the delete marker adds nothing.
         """
         store = IndexedTransactionalKeyValueStore()
         store.put("1", IndexingTest.Stuff(2, 3))
@@ -258,7 +297,19 @@ class IndexingTest(AbstractUnitTest):
         self.assertEqual(list(store.indexes_by_name["a_idx"].index.get(5)), ["1"])
 
     def test_index_maintenance_transactional_store_update_delete_abort(self):
-        """Aborting after a delete (preceded by an update) restores the index to its state before the transaction."""
+        """The delete already removes the version (7, 7) of the preceding update from the index; after the abort,
+        the index is as before the transaction.
+
+        t1                          t2
+        begin
+        update "1" to (7, 7)
+        delete "1"
+        abort
+                                    begin
+                                    read all -> sees (2, 3)
+
+        Before t1 begins, the store holds "1"=(2, 3) with an equality index on a.
+        """
         store = IndexedTransactionalKeyValueStore()
         store.put("1", IndexingTest.Stuff(2, 3))
         store.create_index("a_idx", "a", "=")
@@ -313,7 +364,16 @@ class IndexingTest(AbstractUnitTest):
         self.assertEqual(list(store.indexes_by_name["a_idx"].index.get(2)), ["1"])
 
     def test_create_index_after_committed_delete(self):
-        """Creating an index after a committed delete indexes every committed object version, none for the delete."""
+        """Creating an index after a committed delete indexes every committed object version, none for the delete.
+
+        t1
+        begin
+        delete "2"
+        commit
+
+        Before t1 begins, the store holds "1"=(2, 3) and "2"=(4, 3) and no index; the equality index on a is
+        created after t1 has committed.
+        """
         store = IndexedTransactionalKeyValueStore()
         store.put("1", IndexingTest.Stuff(2, 3))
         store.put("2", IndexingTest.Stuff(4, 3))
@@ -508,23 +568,6 @@ class BPlusTreeTest(unittest.TestCase):
         self.assertRaises(NotImplementedError, leaf.get_all_in_range, 0, 10)
         self.assertRaises(NotImplementedError, leaf.is_full)
         self.assertRaises(NotImplementedError, leaf.consistency_check)
-
-
-class PrefixDigitMapping(KeyMapping[str, int]):
-    """A simple implementation of a key mapping that maps a key to a bucket based on a prefix.
-    On each level we take one character of the key and map it to a bucket.
-    """
-
-    def map(self, key: str, level: int, descriptor: Descriptor = None) -> int:
-        """Maps the given key string to a bucket at the given level.
-        @param key: The key string to map.
-        @param level: The level of the mapping.
-        @param descriptor: The optional descriptor to use for the mapping.
-
-        """
-        assert level < len(key)
-
-        return int(key[level])
 
 
 class RadixTrieTest(unittest.TestCase):

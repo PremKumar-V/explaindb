@@ -23,8 +23,9 @@ other.
   [`system/interfaces/query_processing/query_processing.py`](../../../system/interfaces/query_processing/query_processing.py).
 - **Notebook:** [`Result-DB.ipynb`](../../../notebooks/Result-DB.ipynb) — executes a two-join query
   (`persons ⋈ orders ⋈ books WHERE price < 10`) by assembling and running the operator pipeline.
-- **Tests:** [`system/tests/test_query_processing.py`](../../../system/tests/test_query_processing.py),
-  [`system/tests/test_code_gen.py`](../../../system/tests/test_code_gen.py).
+- **Tests:**
+  [`system/tests/query_processing/test_query_processing.py`](../../../system/tests/query_processing/test_query_processing.py),
+  [`system/tests/query_processing/test_code_gen.py`](../../../system/tests/query_processing/test_code_gen.py).
 
 ## The idea in one picture
 

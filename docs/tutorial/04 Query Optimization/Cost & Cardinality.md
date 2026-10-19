@@ -20,8 +20,9 @@ The enumerator asks the cost function to score each candidate split and keeps th
   [`system/query_optimization/cost_function.py`](../../../system/query_optimization/cost_function.py)
   (`C_Out`).
 - **Interface:** [`system/interfaces/cost_functions.py`](../../../system/interfaces/cost_functions.py).
-- **Tests:** [`system/tests/test_plan_enumeration.py`](../../../system/tests/test_plan_enumeration.py) —
-  asserts exact cost and plan-table values.
+- **Tests:**
+  [`system/tests/query_optimization/test_plan_enumeration.py`](../../../system/tests/query_optimization/test_plan_enumeration.py)
+  — asserts exact cost and plan-table values.
 
 ## The idea in one picture
 

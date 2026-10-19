@@ -28,7 +28,7 @@ from typing import Any
 import yaml
 
 # the CI configuration, found relative to this file so that the test does not depend on the working directory:
-CI_CONFIG: Path = Path(__file__).resolve().parents[2] / ".gitlab-ci.yml"
+CI_CONFIG: Path = Path(__file__).resolve().parents[3] / ".gitlab-ci.yml"
 
 # top-level keys of a GitLab CI configuration that are not jobs:
 RESERVED_KEYS: frozenset[str] = frozenset(

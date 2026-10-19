@@ -28,9 +28,9 @@ import subprocess
 import sys
 import unittest
 
-# Repo root: three levels up from system/tests/this_file.py.
+# Repo root: four levels up from system/tests/playground/this_file.py.
 _REPO_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
 

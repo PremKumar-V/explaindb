@@ -20,7 +20,7 @@ beyond memory, so the algorithm can be written as if everything were in memory.
   (in-memory), and `queue_factories.py`.
 - **Interface:** [`system/interfaces/queues.py`](../../../system/interfaces/queues.py).
 - **Tests:** [`system/tests/test_sorting.py`](../../../system/tests/test_sorting.py),
-  [`system/tests/test_queues.py`](../../../system/tests/test_queues.py).
+  [`system/tests/queues/test_queues.py`](../../../system/tests/queues/test_queues.py).
 
 ## The idea in one picture
 

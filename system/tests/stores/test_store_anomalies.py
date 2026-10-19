@@ -47,6 +47,21 @@ Faker.seed(42)
 class StoreTestAnomalies(AbstractUnitTest):
 
     def test_update_multiple_objects_in_TA(self):
+        """A TA that updates the same objects several times holds one wip entry per object and each object once in
+        its write set; its commit adds one committed version per object.
+
+        The store is bulk-loaded with 100 random objects "0" to "99". The TA updates five of them in three rounds,
+        each time to its committed version with b increased by 4242:
+
+        TA
+        begin
+        update "42", "11", "0", "7", "99"     (round 1)
+        update "42", "11", "0", "7", "99"     (round 2)
+        update "42", "11", "0", "7", "99"     (round 3)
+        commit
+
+        After the commit, each object has two committed versions and no wip entry.
+        """
         tkvs = TransactionalKeyValueStore()
         tkvs.bulkload(self._create_fake_data())
         TA_id = tkvs.begin_transaction()
@@ -101,16 +116,23 @@ class StoreTestAnomalies(AbstractUnitTest):
         self.assertEqual(len(tkvs.TD[TA_id].write_set), len(object_ids_to_test))
 
     def test_store_snapshot_isolation_TA_self_modification(self):
-        """Tests if the store correctly handles reads from the store in particular w.r.t. snapshot isolation from the
-        point of view of a single TA"""
+        """A TA that updated an object keeps reading its own work-in-progress version, even after a newer committed
+        version appears; the test adds that version directly to the store, as if another TA had committed it.
+
+        TA 1                                another TA (simulated)
+        begin
+        read a==4243 -> sees "4242"=(4243, 0)
+        update "4242" to (4243, 4243)
+                                            committed version "4242"=(45, 45)
+        read a==4243 -> sees "4242"=(4243, 4243)
+        """
 
         tkvs = TransactionalKeyValueStore()
         tkvs.bulkload(self._create_fake_data())
 
         object_id: str = "4242"
 
-        # create an object with an object_id that is guaranteed to not be in the store yet:
-        # (if they were, put would overwrite them anyway
+        # create an object whose id is not in the store yet (put fails for an existing id):
         tkvs.put(object_id, StoreTestAnomalies.Stuff(4243, 0))
 
         TA_ID = tkvs.begin_transaction()
@@ -139,7 +161,7 @@ class StoreTestAnomalies(AbstractUnitTest):
         self.assertEqual(tkvs.key_value_store["4242"].wip.value.b, 4243)
 
         # bypass store semantics and add a new committed version
-        # simulating an insert from another concurrent transaction with a greater TA_ID than <TA_ID>:
+        # simulating an update by another concurrent transaction with a greater TA_ID than <TA_ID>:
         tkvs.key_value_store["4242"].committed.append(
             VersionedKeyValueStore.UpdateEntry(
                 start_validity=TA_ID + 1, value=StoreTestAnomalies.Stuff(45, 45)
@@ -199,8 +221,23 @@ class StoreTestAnomalies(AbstractUnitTest):
             tkvs._get_visible_object_version(object_id, 6)
 
     def test_read_write_conflict(self):
-        """Tests if the store correctly handles reads from the store in particular w.r.t. snapshot isolation while
-        interacting with other modifying TAs."""
+        """A TA keeps seeing its snapshot while another TA updates and commits the object it read; when the first TA
+        then writes and tries to commit, validation aborts it. A TA that begins after that commit sees the new
+        version.
+
+        TA 1                                TA 2                                TA 3
+        begin
+                                            begin
+        read a==7 -> sees "4242"=(7, 0)
+                                            update "4242" to (7, 8)
+        read a==7 -> sees "4242"=(7, 0)
+                                            commit
+        read a==7 -> sees "4242"=(7, 0)
+        update "4242" to (7, 4534)
+        commit -> aborted
+                                                                                begin
+                                                                                read a==7 -> sees "4242"=(7, 8)
+        """
 
         tkvs = TransactionalKeyValueStore()
 
@@ -254,7 +291,7 @@ class StoreTestAnomalies(AbstractUnitTest):
         self.assertEqual(len(tkvs.key_value_store[object_id].committed), 2)
 
         # TA_ID_1 must not see the new value even though TA_ID_2 has already committed,
-        # TA_ID 1 still sees the old object as it is running under snapshot isolation -> repeatable reads
+        # TA_ID_1 still sees the old object as it is running under snapshot isolation -> repeatable reads
         result_reread = list(tkvs.read_objects(TA_ID_1, where=where))
         self.assertEqual(result_initial, result_reread)
 
@@ -275,13 +312,24 @@ class StoreTestAnomalies(AbstractUnitTest):
         result_reread_TA_3: list[tuple[str, object]] = list(
             tkvs.read_objects(TA_ID_3, where=where)
         )
-        self.assertEqual(len(result_initial), 1)
-        item_reread: tuple[str, object] = result_reread_TA_3[0]
-
-        self.assertEqual(item_reread[1], new_version)
+        self.assertEqual(result_reread_TA_3, [(object_id, new_version)])
 
     def test_write_skew_anomaly(self):
-        """Checks for write skew anomaly detection. Checks both validation algorithms"""
+        """Two TAs that read the same two objects and each update a different one cannot both commit (write skew):
+        the second commit fails validation. Checked for both validation methods.
+
+        TA 1                                TA 2
+        begin
+                                            begin
+        read a==1 -> sees X=(1, 0)
+        read a==2 -> sees Y=(2, 0)
+                                            read a==1 -> sees X=(1, 0)
+                                            read a==2 -> sees Y=(2, 0)
+        update X to (1, 100)
+                                            update Y to (2, 200)
+        commit -> succeeds
+                                            commit -> aborted
+        """
 
         for use_brute_force_validation in [
             True,
@@ -292,7 +340,7 @@ class StoreTestAnomalies(AbstractUnitTest):
                 use_brute_force_validation=use_brute_force_validation
             )
 
-            # create two data items A and B:
+            # create two data items X and Y:
             tkvs.put("X", StoreTestAnomalies.Stuff(1, 0))
             tkvs.put("Y", StoreTestAnomalies.Stuff(2, 0))
 
@@ -343,7 +391,22 @@ class StoreTestAnomalies(AbstractUnitTest):
                 tkvs.commit_transaction(TA_ID_2)
 
     def test_delete_semantics(self):
-        """Tests if the store correctly handles object deletions"""
+        """A committed delete hides the object from TAs that begin later, and a committed TA can no longer read or
+        write.
+
+        TA 1                                TA 2
+        begin
+        read a==4243 -> sees "4042"=(4243, 0)
+        delete "4042"
+        commit
+        read a==4243 -> fails
+        delete "4042" -> fails
+        update "4042" to (4243, 0) -> fails
+                                            begin
+                                            read a==4243 -> sees nothing
+
+        Each call of TA 1 after its commit raises a RuntimeError.
+        """
 
         tkvs: TransactionalKeyValueStore = TransactionalKeyValueStore()
 
@@ -376,7 +439,7 @@ class StoreTestAnomalies(AbstractUnitTest):
         # and nothing was added to the commit list:
         self.assertEqual(len(tkvs.key_value_store[object_id].committed), 1)
 
-        # we have aa delete marker now:
+        # we have a delete marker now:
         self.assertTrue(
             isinstance(
                 tkvs.key_value_store[object_id].wip, VersionedKeyValueStore.DeleteEntry
@@ -418,6 +481,15 @@ class StoreTestAnomalies(AbstractUnitTest):
         self.assertEqual(len(result_reread_TA_2), 0)
 
     def test_write_write_conflict(self):
+        """A TA that updates an object for which another running TA holds a work-in-progress version is aborted:
+        there is only one writer per object at a time.
+
+        TA 1                                TA 2
+        begin
+                                            begin
+        update "4242" to (1, 1)
+                                            update "4242" to (1, 2) -> aborted
+        """
         tkvs = TransactionalKeyValueStore()
         object_id = "4242"
         tkvs.put(object_id, StoreTestAnomalies.Stuff(1, 0))
@@ -435,14 +507,14 @@ class StoreTestAnomalies(AbstractUnitTest):
     def test_write_write_conflict_on_delete(self):
         """A transaction that deletes an object on which another transaction holds a wip entry is aborted.
 
-        t1                                  t2
+        TA 1                                TA 2
         begin
                                             begin
         update or delete "4242"
                                             delete "4242" -> aborted
         commit -> succeeds
 
-        t2 is removed from the transaction dictionary and its journal holds only Begin and Abort; t1's wip entry
+        TA 2 is removed from the transaction dictionary and its journal holds only Begin and Abort; TA 1's wip entry
         is untouched. Checked for a first writer that updates and one that deletes.
         """
         for first_write in ["update", "delete"]:
@@ -493,6 +565,19 @@ class StoreTestAnomalies(AbstractUnitTest):
                 self.assertEqual(tkvs.committed_transactions_trace[-1], TA_ID_1)
 
     def test_double_update_from_same_transaction(self):
+        """A TA that updates an object twice and then deletes it always reads its own latest change.
+
+        TA 1
+        begin
+        update "4242" to (1, 1)
+        read a==1 -> sees "4242"=(1, 1)
+        update "4242" to (1, 2)
+        read a==1 -> sees "4242"=(1, 2)
+        delete "4242"
+        read a==1 -> sees nothing
+
+        Before TA 1 begins, the store holds "4242"=(1, 0).
+        """
         tkvs = TransactionalKeyValueStore()
         object_id = "4242"
         tkvs.put(object_id, StoreTestAnomalies.Stuff(1, 0))
@@ -524,6 +609,17 @@ class StoreTestAnomalies(AbstractUnitTest):
         self.assertEqual(len(result), 0)
 
     def test_checksums_on_self_updates(self):
+        """With validation method 1, a TA commits although its own update made an object it read no longer match the
+        read: the checksum of a read is computed over the committed snapshot, without the TA's own changes.
+
+        t1
+        begin
+        read a==1 -> sees "1"=(1, 1)
+        update "1" to (2, 2)
+        read a==1 -> sees nothing
+        commit -> succeeds
+        """
+
         @dataclass(frozen=True)
         class T:
             a: int
@@ -556,7 +652,19 @@ class StoreTestAnomalies(AbstractUnitTest):
         self.assertEqual(tkvs.committed_transactions_trace[-1], t1)
 
     def test_read_all(self):
-        """Tests if the store correctly handles read_all requests"""
+        """A TA that reads all objects with a TrueClause and then writes fails validation if another TA committed
+        a change to one of them meanwhile, and commits if the other TA did not commit. Checked for both validation
+        methods.
+
+        t1                                  t2
+        begin
+                                            begin
+                                            update "1" to (11, 11)
+                                            commit (only if t2 commits)
+        read all -> sees "1" and "2"
+        update "2" to (22, 22)
+        commit -> aborted if t2 committed, else succeeds
+        """
 
         @dataclass(frozen=True)
         class T:
@@ -589,7 +697,7 @@ class StoreTestAnomalies(AbstractUnitTest):
                 # t1 modifies something (possibly influenced by the previous read)
                 tkvs.update_object("2", T(22, 22), t1)
 
-                # t1 commits and fails validation:
+                # t1 commits; it fails validation if t2 committed its change:
                 if t2_commits:
                     with self.assertRaises(TransactionAbortedException):
                         tkvs.commit_transaction(t1)
@@ -644,7 +752,10 @@ class StoreTestAnomalies(AbstractUnitTest):
     def test_read_own_insert(self):
         """A TA sees the object it inserted itself, next to the pre-existing objects.
 
-        t inserts C and reads everything: it sees A and C with their values.
+        t
+        begin
+        insert C=(2, 0)
+        read all -> sees A=(1, 0) and C=(2, 0)
         """
         tkvs: TransactionalKeyValueStore = TransactionalKeyValueStore()
         tkvs.put("A", StoreTestAnomalies.Stuff(1, 0))
@@ -664,7 +775,17 @@ class StoreTestAnomalies(AbstractUnitTest):
     def test_aborted_insert_is_invisible_and_key_can_be_reinserted(self):
         """An aborted insert leaves no visible object behind, and the key can be inserted again later.
 
-        t inserts C and aborts: t2 sees only A. t3 inserts C again and commits: t4 sees A and C with t3's value.
+        t                       t2                      t3                      t4
+        begin
+        insert C=(2, 0)
+        abort
+                                begin
+                                read all -> sees only A=(1, 0)
+                                                        begin
+                                                        insert C=(3, 0)
+                                                        commit
+                                                                                begin
+                                                                                read all -> sees A=(1, 0) and C=(3, 0)
         """
         tkvs: TransactionalKeyValueStore = TransactionalKeyValueStore()
         tkvs.put("A", StoreTestAnomalies.Stuff(1, 0))
@@ -928,6 +1049,54 @@ class StoreTestAnomalies(AbstractUnitTest):
                 tkvs.commit_transaction(t_i)
                 self.assertEqual(tkvs.committed_transactions_trace[-1], t_i)
 
+    def test_read_only_transaction_commits_despite_concurrent_change_of_read_object(
+        self,
+    ):
+        """A read-only TA always commits, even if another TA committed a change to an object it read.
+
+        t_i                                 t_j
+        begin
+                                            begin
+        read a==42 -> sees A=(42, 0)
+                                            update A to (7, 0)
+                                            commit
+        read a==42 -> still sees A=(42, 0)
+        commit -> succeeds
+
+        t_i writes nothing, so it is validated against its own snapshot, in which nothing changed. The same schedule
+        with a write of t_i aborts, see test_validation_detects_lost_update_on_read_object. Checked for both
+        validation methods.
+        """
+        for use_brute_force_validation in [True, False]:
+            with self.subTest(use_brute_force_validation=use_brute_force_validation):
+                tkvs: TransactionalKeyValueStore = TransactionalKeyValueStore(
+                    use_brute_force_validation=use_brute_force_validation
+                )
+                tkvs.put("A", StoreTestAnomalies.Stuff(42, 0))
+
+                t_i: int = tkvs.begin_transaction()
+                t_j: int = tkvs.begin_transaction()
+
+                # t_i reads A:
+                result: list[tuple[str, object]] = tkvs.read_objects(
+                    t_i, WHERE_Clause("a", "==", 42)
+                )
+                self.assertEqual(result, [("A", StoreTestAnomalies.Stuff(42, 0))])
+
+                # t_j changes A, so that it no longer matches t_i's read, and commits:
+                tkvs.update_object("A", StoreTestAnomalies.Stuff(7, 0), t_j)
+                tkvs.commit_transaction(t_j)
+
+                # snapshot isolation: t_i still sees the old version of A:
+                result_reread: list[tuple[str, object]] = tkvs.read_objects(
+                    t_i, WHERE_Clause("a", "==", 42)
+                )
+                self.assertEqual(result_reread, result)
+
+                # t_i wrote nothing, so it must commit:
+                tkvs.commit_transaction(t_i)
+                self.assertEqual(tkvs.committed_transactions_trace[-1], t_i)
+
     def test_validation_detects_write_skew_on_objects_with_equal_hash(self):
         """A TA aborts if a concurrent TA changed an object it read, even if both versions have the same Python hash.
 
@@ -1149,7 +1318,13 @@ class StoreTestAnomalies(AbstractUnitTest):
         second time on the committed snapshot to compute the checksum. The result contains the transaction's own
         change.
 
-        Checked for both store classes and both validation methods.
+        t_i
+        begin
+        update A to (42, 1)
+        read a==42 -> sees A=(42, 1)
+
+        Before t_i begins, the store holds A=(42, 0) and B=(7, 0). Checked for both store classes and both validation
+        methods.
         """
 
         class CountingWHERE_Clause(WHERE_Clause):
