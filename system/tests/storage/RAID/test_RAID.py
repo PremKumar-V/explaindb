@@ -312,7 +312,7 @@ class RAIDPerformanceTest(AbstractUnitTest):
                 (disks_inner - 1) * (disks_outer - 1) * 100,
             )
             self.assertEqual(
-                array.get_sequential_read_performance(),
+                array.get_sequential_write_performance(),
                 (disks_inner - 1) * (disks_outer - 1) * 100,
             )
             self.assertEqual(
