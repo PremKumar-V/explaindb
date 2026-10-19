@@ -30,14 +30,14 @@ from system.indexes.christmas_tree import ChristmasTree
 from system.indexes.indexes import (
     PythonDictionaryIndex,
 )
-from system.indexes.radix_trie import RadixTrie, KeyMapping
+from system.indexes.radix_trie import RadixTrie, PrefixDigitMapping
 from system.query_processing.predicates import TrueClause, WHERE_Clause
 from system.stores.IndexedMVCC import IndexedTransactionalKeyValueStore
 from system.stores.MVCC import TransactionAbortedException
 from faker import Faker
 
 from system.tests.abstract_unit_test import AbstractUnitTest
-from system.utils import Triangle, Vector, Descriptor
+from system.utils import Triangle, Vector
 
 Faker.seed(42)
 
@@ -568,23 +568,6 @@ class BPlusTreeTest(unittest.TestCase):
         self.assertRaises(NotImplementedError, leaf.get_all_in_range, 0, 10)
         self.assertRaises(NotImplementedError, leaf.is_full)
         self.assertRaises(NotImplementedError, leaf.consistency_check)
-
-
-class PrefixDigitMapping(KeyMapping[str, int]):
-    """A simple implementation of a key mapping that maps a key to a bucket based on a prefix.
-    On each level we take one character of the key and map it to a bucket.
-    """
-
-    def map(self, key: str, level: int, descriptor: Descriptor = None) -> int:
-        """Maps the given key string to a bucket at the given level.
-        @param key: The key string to map.
-        @param level: The level of the mapping.
-        @param descriptor: The optional descriptor to use for the mapping.
-
-        """
-        assert level < len(key)
-
-        return int(key[level])
 
 
 class RadixTrieTest(unittest.TestCase):

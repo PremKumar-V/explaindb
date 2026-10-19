@@ -45,6 +45,23 @@ class KeyMapping[Key, Value](ABC):
         """
 
 
+class PrefixDigitMapping(KeyMapping[str, int]):
+    """A simple implementation of a key mapping that maps a key to a bucket based on a prefix.
+    On each level we take one character of the key and map it to a bucket.
+    """
+
+    def map(self, key: str, level: int, descriptor: Descriptor = None) -> int:
+        """See :meth:`KeyMapping.map`.
+
+        The key is a string of decimal digits; returns the digit at position ``level``, so the key must be longer
+        than ``level``, and the digit at each inner-node level must be smaller than the number of children per inner
+        node. ``descriptor`` is ignored.
+        """
+        assert level < len(key)
+
+        return int(key[level])
+
+
 class RadixTrie[Key, Value](KeyValueStore[Key, Value], Drawable):
     """A simple implementation of a radix trie data structure."""
 
