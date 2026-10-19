@@ -634,7 +634,7 @@ class OracleThreeTransactionsTest(unittest.TestCase):
         begin
                                     begin
         read a==1 → {x}
-                                    read a==1 → {x}    <- position 3
+                                    read a==1 → {x}    <- position 3 (counted from 0)
         update y ← (a=1, b=0)
                                     delete x
         commit

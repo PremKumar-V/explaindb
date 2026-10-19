@@ -871,7 +871,7 @@ class RunToTest(unittest.TestCase):
                                     begin
         update x ← (a=2, b=0)
                                     update x ← (a=3, b=0) -> aborted
-        commit                                        <- operation 5: every transaction has ended
+        commit                                        <- operation 5 (counted from 1): every transaction has ended
                                     commit -> skipped
         ```
 
@@ -908,7 +908,7 @@ class RunToTest(unittest.TestCase):
         begin
                                     begin
         read a==1 → {x}
-                                    delete x       <- operation 4
+                                    delete x          <- operation 4 (counted from 1)
                                     commit
         update z ← (a=0, b=1)
         commit -> aborted
@@ -950,7 +950,7 @@ class ChecksumTest(unittest.TestCase):
                                     read a==1 → {x}
         update y ← (a=1, b=0)
                                     delete x
-        commit                                     <- operation 7
+        commit                                        <- operation 7 (counted from 1)
                                     commit -> aborted
         ```
 
