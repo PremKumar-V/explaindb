@@ -37,7 +37,7 @@ from system.stores.MVCC import TransactionAbortedException
 from faker import Faker
 
 from system.tests.abstract_unit_test import AbstractUnitTest
-from system.utils import Triangle, Vector
+from system.indexes.utils import Triangle, Vector
 
 Faker.seed(42)
 

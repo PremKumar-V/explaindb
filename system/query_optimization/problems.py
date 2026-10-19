@@ -21,7 +21,7 @@
 """Problem type representing relation subsets as bit sequences for join enumeration."""
 
 from __future__ import annotations
-from system.bit_sequences import IntegerBitSequence
+from system.indexes.bit_sequences import IntegerBitSequence
 from typing import Iterator
 
 

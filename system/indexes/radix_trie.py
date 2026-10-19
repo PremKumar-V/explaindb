@@ -27,7 +27,7 @@ from typing import Iterator
 from ipycanvas import Canvas
 
 from system.interfaces.indexing.Index import KeyValueStore, PutInfo
-from system.utils import Descriptor, Drawable
+from system.indexes.utils import Descriptor, Drawable
 
 
 class KeyMapping[Key, Value](ABC):

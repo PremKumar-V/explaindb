@@ -29,7 +29,11 @@ from typing import Type
 from system.interfaces.bit_sequence import (
     UncompressedBitSequence,
 )
-from system.bit_sequences import IntegerBitSequence, BitListBitSequence, WAHBitSequence
+from system.indexes.bit_sequences import (
+    IntegerBitSequence,
+    BitListBitSequence,
+    WAHBitSequence,
+)
 
 
 class BitSequenceTests(unittest.TestCase):
@@ -433,7 +437,7 @@ class BitSequenceTests(unittest.TestCase):
         Observed (buggy): ``RecursionError`` while iterating.
 
         The defect is in ``WAHBitSequence.SetBitsIterator.get_next_iterator``
-        in ``system/bit_sequences.py`` (NOT in
+        in ``system/indexes/bit_sequences.py`` (NOT in
         ``system/interfaces/bit_sequence.py``), which recurses once per
         skipped 0-fill word instead of iterating.
         """

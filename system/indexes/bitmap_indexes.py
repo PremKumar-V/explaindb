@@ -31,7 +31,7 @@ from system.interfaces.bit_sequence import (
     UncompressedBitSequence,
     CompressedBitSequence,
 )
-from system.bit_sequences import IntegerBitSequence
+from system.indexes.bit_sequences import IntegerBitSequence
 
 
 class SortedBitmapIndex[Key, Value](BitmapIndex[Key, Value], ABC):

@@ -26,7 +26,7 @@
 from __future__ import annotations
 import unittest
 from typing import Type, Generator
-from system.bit_sequences import (
+from system.indexes.bit_sequences import (
     BitListBitSequence,
     IntegerBitSequence,
     UncompressedBitSequence,
