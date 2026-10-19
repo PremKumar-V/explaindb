@@ -364,6 +364,33 @@ class ExplanationTest(unittest.TestCase):
         transaction committed meanwhile and whether the read returned it before (lost update) or returns it now
         (phantom insert, where T1 aborts).
 
+        Lost update, with method 1 and with method 2:
+
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read all → {x}
+                                    read all → {x}
+        update x ← (a=1, b=1)
+        commit
+                                    update x ← (a=1, b=2)
+                                    commit -> aborted <- position 7 (counted from 0)
+        ```
+
+        Phantom insert, with method 2:
+
+        ```text
+        T1                          T2
+        begin
+        read a==1 → {x}
+                                    begin
+                                    update y ← (a=1, b=0)
+                                    commit
+        update z ← (a=0, b=1)
+        commit -> aborted                             <- position 6 (counted from 0)
+        ```
+
         Would fail if the explanation did not follow the check of the selected method, or confused the results at
         the read and now.
         """
@@ -737,6 +764,20 @@ class ExplanationTest(unittest.TestCase):
     def test_commit_that_succeeds_raises(self) -> None:
         """Asked to explain a commit that the store does not abort, abort_explanation raises an AssertionError.
 
+        The serial scenario, with method 1:
+
+        ```text
+        T1                          T2
+        begin
+        read a==1 → {x}
+        update y ← (a=1, b=0)
+        commit                                        <- position 3 (counted from 0): the commit to explain
+                                    begin
+                                    read a==1 → {x, y}
+                                    delete x
+                                    commit
+        ```
+
         Would fail if the explanation invented a reason for a commit that passed the validation.
         """
         s: Scenario = scenario_named("serial")
@@ -746,6 +787,20 @@ class ExplanationTest(unittest.TestCase):
 
     def test_nothing_to_explain(self) -> None:
         """The serial scenario has no explanations, before and after its end.
+
+        With method 2, the first run stops after operation 3, the second one runs to the end:
+
+        ```text
+        T1                          T2
+        begin
+        read a==1 → {x}
+        update y ← (a=1, b=0)                         <- operation 3 (counted from 1): the first run stops here
+        commit
+                                    begin
+                                    read a==1 → {x, y}
+                                    delete x
+                                    commit
+        ```
 
         Would fail if an operation that went fine got an explanation.
         """
@@ -856,7 +911,7 @@ class RunToTest(unittest.TestCase):
                                     delete x       <- operation 4
                                     commit
         update z ← (a=0, b=1)
-        commit -> aborts
+        commit -> aborted
         ```
 
         Would fail if a work-in-progress delete were shown as an update or without its owner, or if a committed
@@ -896,7 +951,7 @@ class ChecksumTest(unittest.TestCase):
         update y ← (a=1, b=0)
                                     delete x
         commit                                     <- operation 7
-                                    commit -> aborts
+                                    commit -> aborted
         ```
 
         Would fail if the checksum now were computed on another state than the one the commit validates against,
@@ -979,12 +1034,24 @@ class TransactionStateTest(unittest.TestCase):
     update y ← (a=1, b=0)
                                 delete x
     commit
-                                commit -> aborts
+                                commit -> aborted
     ```
     """
 
     def test_transaction_not_begun_yet(self) -> None:
         """After T1's begin, T2 has not begun: it has no id and shows nothing.
+
+        ```text
+        T1                          T2
+        begin                                         <- operation 1 (counted from 1): the run stops here
+                                    begin
+        read a==1 → {x}
+                                    read a==1 → {x}
+        update y ← (a=1, b=0)
+                                    delete x
+        commit
+                                    commit -> aborted
+        ```
 
         Would fail if a transaction that has not begun were left out, or shown with an id or a snapshot.
         """
@@ -998,6 +1065,18 @@ class TransactionStateTest(unittest.TestCase):
     def test_work_in_progress_insert_and_running_writer(self) -> None:
         """While T1's insert of y runs (after operation 5), y has no committed version, and T1 sees y and lists its
         read and write.
+
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read a==1 → {x}
+                                    read a==1 → {x}
+        update y ← (a=1, b=0)                         <- operation 5 (counted from 1): the run stops here
+                                    delete x
+        commit
+                                    commit -> aborted
+        ```
 
         Would fail if an object without committed version were left out, if the work-in-progress version did not
         name its writer, or if a running transaction did not see its own write.
@@ -1021,6 +1100,18 @@ class TransactionStateTest(unittest.TestCase):
 
     def test_aborted_transaction_keeps_its_read_and_write(self) -> None:
         """T2 aborts at its commit and still lists what it read and wrote, but sees nothing any more.
+
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read a==1 → {x}
+                                    read a==1 → {x}
+        update y ← (a=1, b=0)
+                                    delete x
+        commit
+                                    commit -> aborted
+        ```
 
         Would fail if the read and the write that made T2 abort disappeared with the abort (the store forgets an
         aborted transaction).

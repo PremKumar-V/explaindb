@@ -784,7 +784,30 @@ class CountersTest(unittest.TestCase):
     def test_overlapping_committed_writers(self) -> None:
         """Two committed writers overlap if each one begins before the other one ends.
 
-        Positions are indexes in the schedule.
+        Positions are indexes in the schedule; the made-up records use only the positions listed. Each record also
+        contains a write of x (a read for a read-only transaction); it has no position of its own and is not shown.
+        T1 and T2 overlap:
+
+        ```text
+        position    T1                T2
+        0           begin
+        2                             begin
+        5           commit
+        7                             commit
+        ```
+
+        They do not overlap if T2 begins after T1 ended:
+
+        ```text
+        position    T1                T2
+        0           begin
+        3           commit
+        4                             begin
+        7                             commit
+        ```
+
+        With the positions of the first schedule, they do not count as overlapping committed writers if T2 does not
+        commit (its record has committed=False), or if T2 only reads.
         """
         self.assertTrue(
             overlapping_committed_writers(
@@ -797,7 +820,7 @@ class CountersTest(unittest.TestCase):
                 [made_up_writer("T1", 0, 3), made_up_writer("T2", 4, 7)]
             )
         )
-        # an aborted writer does not count:
+        # a writer that did not commit does not count:
         self.assertFalse(
             overlapping_committed_writers(
                 [
@@ -839,7 +862,20 @@ class CountersTest(unittest.TestCase):
         )
 
     def test_two_commits_during_writer_aborted_at_commit(self) -> None:
-        """A writer aborted in its validation phase counts as well, as its validation saw the two commits."""
+        """A writer aborted in its validation phase counts as well, as its validation saw the two commits.
+
+        Each record also contains a write of x; it has no position of its own and is not shown.
+
+        ```text
+        T1                T2                T3
+        begin
+                          begin
+                                            begin
+                          commit
+                                            commit
+        commit -> aborted
+        ```
+        """
         self.assertTrue(
             two_commits_during_writer(
                 [
@@ -876,7 +912,33 @@ class CountersTest(unittest.TestCase):
         )
 
     def test_commits_of_readers_or_around_a_reader_are_not_counted(self) -> None:
-        """A read-only transaction neither counts as a commit nor as the transaction that sees the commits."""
+        """A read-only transaction neither counts as a commit nor as the transaction that sees the commits.
+
+        Each record also contains a write of x, or a read for the read-only transaction; it has no position of its own
+        and is not shown. In the first case T3 is read-only:
+
+        ```text
+        T1                T2                T3 (read-only)
+        begin
+                          begin
+                                            begin
+                          commit
+                                            commit
+        commit
+        ```
+
+        In the second case T1 is read-only:
+
+        ```text
+        T1 (read-only)    T2                T3
+        begin
+                          begin
+                                            begin
+                          commit
+                                            commit
+        commit
+        ```
+        """
         # T3 is read-only, so only one writer commits during T1:
         self.assertFalse(
             two_commits_during_writer(

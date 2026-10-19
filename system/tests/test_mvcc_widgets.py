@@ -405,6 +405,18 @@ class MvccPlaygroundTest(unittest.TestCase):
         """At the end of write skew via phantom, switching the mode runs the schedule again: not serializable without
         validation, serializable with method 2 (T2 aborts), each in the colour of its kind.
 
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read a==1 → {x}
+                                    read a==1 → {x}
+        update y ← (a=1, b=0)
+                                    delete x
+        commit
+                                    commit -> committed without validation, aborted with method 2
+        ```
+
         Would fail if switching the mode did not run the schedule again or the verdict box had the wrong colour.
         """
         playground = loaded("write skew via phantom (insert and delete)")
@@ -567,6 +579,36 @@ class MvccPlaygroundTest(unittest.TestCase):
         """The grid gets a fourth, wider column for "why" at the end of write skew without validation, and only the
         number column and a column per transaction for the serial scenario.
 
+        Write skew, without validation:
+
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read a==1 → {x}
+        read a==2 → {y}
+                                    read a==1 → {x}
+                                    read a==2 → {y}
+        update x ← (a=1, b=100)
+                                    update y ← (a=2, b=200)
+        commit
+                                    commit
+        ```
+
+        Serial, with method 2:
+
+        ```text
+        T1                          T2
+        begin
+        read a==1 → {x}
+        update y ← (a=1, b=0)
+        commit
+                                    begin
+                                    read a==1 → {x, y}
+                                    delete x
+                                    commit
+        ```
+
         Would fail if the grid's columns did not follow its rows, so that the explanations wrapped into the next
         row or an empty column were added.
         """
@@ -684,6 +726,17 @@ class MvccPlaygroundTest(unittest.TestCase):
         """Clicking begin, update z, read all, read a==5 and commit for T1 builds that schedule, runs it to its end
         and leaves the chosen scenario.
 
+        Initially x = (a=1, b=0) and y = (a=0, b=0):
+
+        ```text
+        T1
+        begin
+        update z ← (a=5, b=7)
+        read all → {x, y, z}
+        read a==5 → {z}
+        commit
+        ```
+
         Would fail if the dropdowns or the a/b fields were mapped to the wrong parts of the operation.
         """
         playground = MvccPlayground()
@@ -780,6 +833,18 @@ class MvccPlaygroundTest(unittest.TestCase):
     def test_aborted_and_committed_colours(self) -> None:
         """At the end of lost update in method 2, T1's commit is green, T2's aborted commit and T2's row are red.
 
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read all → {x}
+                                    read all → {x}
+        update x ← (a=1, b=1)
+        commit
+                                    update x ← (a=1, b=2)
+                                    commit -> aborted
+        ```
+
         Would fail if an aborted last operation were coloured as merely the last one run, or a successful commit
         as an ordinary operation.
         """
@@ -818,8 +883,20 @@ class MvccPlaygroundTest(unittest.TestCase):
         )
 
     def test_store_table(self) -> None:
-        """At the end of lost update, the store shows both committed versions of x, each with its timestamp and its
-        writer, and nobody writing x.
+        """At the end of lost update with method 2 (the default mode), the store shows both committed versions of x,
+        each with its timestamp and its writer, and nobody writing x.
+
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read all → {x}
+                                    read all → {x}
+        update x ← (a=1, b=1)
+        commit
+                                    update x ← (a=1, b=2)
+                                    commit -> aborted
+        ```
 
         Would fail if a version lost its timestamp or writer, or a version being written were shown.
         """
@@ -867,6 +944,19 @@ class MvccPlaygroundTest(unittest.TestCase):
         """In write skew via phantom with method 1, after T1's commit, T2's checksum now is shown in red, T1's
         without now.
 
+        The operations that have run (T2's commit has not run yet):
+
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read a==1 → {x}
+                                    read a==1 → {x}
+        update y ← (a=1, b=0)
+                                    delete x
+        commit
+        ```
+
         Would fail if the checksums column were missing in method 1, shown in method 2, or a changed checksum were
         not marked.
         """
@@ -892,6 +982,18 @@ class MvccPlaygroundTest(unittest.TestCase):
         """In lost update with method 1, after T1's commit, T2 has only read: its checksum now differs, but it is
         not red, as the store does not validate a transaction that wrote nothing.
 
+        The operations that have run (T2's update of x and its commit have not run yet):
+
+        ```text
+        T1                          T2
+        begin
+                                    begin
+        read all → {x}
+                                    read all → {x}
+        update x ← (a=1, b=1)
+        commit
+        ```
+
         Would fail if a changed checksum were marked as a failing commit for a transaction that has not written.
         """
         playground = loaded("lost update")
@@ -907,6 +1009,15 @@ class MvccPlaygroundTest(unittest.TestCase):
     def test_error_stops_the_run(self) -> None:
         """Deleting an object the store does not have stops the run: the cell is orange, the verdict red with the
         error's quotes escaped, and the position stays at the error, so forward is disabled.
+
+        Initially x = (a=1, b=0) and y = (a=0, b=0), without z:
+
+        ```text
+        T1
+        begin
+        delete z -> error (KeyError: 'z')
+        commit -> not run
+        ```
 
         Would fail if a raised error were coloured as a normal operation or as an abort, the state were not
         escaped, or the position moved past the error, where nothing would change on the screen.
