@@ -18,4 +18,4 @@
 #
 #
 
-"""Unit tests for system.queues."""
+"""Unit tests for system.query_processing.queues."""

@@ -15,12 +15,12 @@ beyond memory, so the algorithm can be written as if everything were in memory.
 
 - **Notebook:** [`External-Merge-Sort.ipynb`](../../../notebooks/External-Merge-Sort.ipynb) — starts from a
   main-memory sort and builds up to the external, run-and-merge version.
-- **Implementation:** [`system/sorting.py`](../../../system/sorting.py) and the queues in
-  [`system/queues/`](../../../system/queues/) — `external_queues.py` (spill-to-disk), `list_queues.py`
-  (in-memory), and `queue_factories.py`.
+- **Implementation:** [`system/query_processing/sorting.py`](../../../system/query_processing/sorting.py) and the
+  queues in [`system/query_processing/queues/`](../../../system/query_processing/queues/) — `external_queues.py`
+  (spill-to-disk), `list_queues.py` (in-memory), and `queue_factories.py`.
 - **Interface:** [`system/interfaces/queues.py`](../../../system/interfaces/queues.py).
-- **Tests:** [`system/tests/test_sorting.py`](../../../system/tests/test_sorting.py),
-  [`system/tests/queues/test_queues.py`](../../../system/tests/queues/test_queues.py).
+- **Tests:** [`system/tests/query_processing/test_sorting.py`](../../../system/tests/query_processing/test_sorting.py),
+  [`system/tests/query_processing/queues/test_queues.py`](../../../system/tests/query_processing/queues/test_queues.py).
 
 ## The idea in one picture
 

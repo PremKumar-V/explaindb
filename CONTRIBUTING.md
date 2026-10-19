@@ -10,7 +10,7 @@ code, so run `black .` before every push.
 
 The unit tests live in `system/tests/`, whose folders mirror the packages of `system/`: the tests of
 `system/stores/` are in `system/tests/stores/`, and the tests of modules directly in `system/` (e.g.
-`system/sorting.py`) are directly in `system/tests/`. Tests that check the repository itself (CI configuration,
+`system/DBMS.py`) are directly in `system/tests/`. Tests that check the repository itself (CI configuration,
 notebooks and the README, the Javadoc hook of the API documentation in `docs/api/javadoc.py`) are in
 `system/tests/repo/`. Every test folder below `system/tests/` needs an `__init__.py`; without it,
 `unittest discover` silently skips its tests. Run all tests with:

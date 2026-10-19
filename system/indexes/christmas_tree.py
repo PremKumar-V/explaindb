@@ -30,7 +30,7 @@ from ipycanvas import Canvas
 
 from system.indexes.radix_trie import RadixTrie, KeyMapping
 from system.interfaces.indexing.Index import PutInfo
-from system.utils import Descriptor, Vector
+from system.indexes.utils import Descriptor, Vector
 
 
 class ChristmasTree[Key, Value](RadixTrie[Key, Value]):

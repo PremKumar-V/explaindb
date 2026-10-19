@@ -31,7 +31,10 @@ from system.data_classes import Person
 import unittest
 
 from system.interfaces.queues import ReadWriteQueue, QueueFactory
-from system.queues.queue_factories import ExternalQueueFactory, ListQueueFactory
+from system.query_processing.queues.queue_factories import (
+    ExternalQueueFactory,
+    ListQueueFactory,
+)
 
 Faker.seed(42)
 fake = Faker()

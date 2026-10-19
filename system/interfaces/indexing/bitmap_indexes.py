@@ -24,7 +24,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Type, Iterator
 from system.interfaces.bit_sequence import BitSequence, CompressedBitSequence
-from system.bit_sequences import IntegerBitSequence, UncompressedBitSequence
+from system.indexes.bit_sequences import IntegerBitSequence, UncompressedBitSequence
 from system.interfaces.indexing.Index import Index, PointQueryMixIn, RangeQueryMixIn
 
 

@@ -25,7 +25,7 @@
 
 import unittest
 
-from system.utils import Vector, Triangle
+from system.indexes.utils import Vector, Triangle
 
 from faker import Faker
 

@@ -92,8 +92,8 @@ class JavadocToRestTest(unittest.TestCase):
         """Colon-less @param/@return tags (no ``:`` after the tag) also convert.
 
         Would fail if the tag regexes required the colon, letting the colon-less
-        form used in system/queues and system/stores fall through unconverted
-        into the rendered output without any Sphinx warning.
+        form used in system/query_processing/queues and system/stores fall through
+        unconverted into the rendered output without any Sphinx warning.
         """
         lines = [
             "@param memory_limit The memory limit in bytes to use for the queue.",

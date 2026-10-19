@@ -45,7 +45,7 @@ cheap pre-filter — skip an expensive lookup when the filter says "definitely n
 - **Implementation:**
   [`system/indexes/bitmap_indexes.py`](../../../system/indexes/bitmap_indexes.py),
   [`system/indexes/bloom_filters.py`](../../../system/indexes/bloom_filters.py), and the bit-sequence
-  types (uncompressed, WAH) in [`system/bit_sequences.py`](../../../system/bit_sequences.py).
+  types (uncompressed, WAH) in [`system/indexes/bit_sequences.py`](../../../system/indexes/bit_sequences.py).
 - **Interfaces:** [`system/interfaces/bit_sequence.py`](../../../system/interfaces/bit_sequence.py),
   [`system/interfaces/indexing/bitmap_indexes.py`](../../../system/interfaces/indexing/bitmap_indexes.py).
 

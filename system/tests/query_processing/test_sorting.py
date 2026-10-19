@@ -33,8 +33,11 @@ from system.data_classes import Person
 import unittest
 
 from system.interfaces.queues import QueueFactory
-from system.queues.queue_factories import ExternalQueueFactory, ListQueueFactory
-from system.sorting import (
+from system.query_processing.queues.queue_factories import (
+    ExternalQueueFactory,
+    ListQueueFactory,
+)
+from system.query_processing.sorting import (
     RunGenerator,
     SingleStreamMerge,
     ExternalMergeSort,

@@ -81,14 +81,15 @@ A small DBMS written for reading, not for speed. Interfaces in
   block assignment (RAID 0/1/4/5) with a reliability and performance cost model.
 - **Indexes** ([`indexes/`](system/indexes)): B⁺-tree, bitmap indexes (equality- and range-encoded),
   Bloom filters, radix tries and the "Christmas tree" (a radix trie with node buffers).
-- **Bit sequences** ([`bit_sequences.py`](system/bit_sequences.py)): plain and WAH-compressed bit
+- **Bit sequences** ([`indexes/bit_sequences.py`](system/indexes/bit_sequences.py)): plain and WAH-compressed bit
   sequences used by the bitmap indexes.
 - **Transactional stores** ([`stores/`](system/stores)): a versioned key-value store and MVCC
   (multi-version concurrency control) with journaling, also with an index.
 - **Query processing** ([`query_processing/`](system/query_processing)): operators such as scan,
   filter, hash join, semi-join and count, plus WHERE-clause predicates.
-- **Sorting and queues** ([`sorting.py`](system/sorting.py), [`queues/`](system/queues)): external
-  merge sort with in-memory and disk-backed queues.
+- **Sorting and queues** ([`query_processing/sorting.py`](system/query_processing/sorting.py),
+  [`query_processing/queues/`](system/query_processing/queues)): external merge sort with in-memory and
+  disk-backed queues.
 - **Query optimization** ([`query_optimization/`](system/query_optimization)): join graphs (chain,
   star, cycle, clique), cardinality estimation, the C_out cost function and plan tables for
   dynamic-programming join ordering.
