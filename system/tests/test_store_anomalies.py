@@ -982,6 +982,54 @@ class StoreTestAnomalies(AbstractUnitTest):
                 tkvs.commit_transaction(t_i)
                 self.assertEqual(tkvs.committed_transactions_trace[-1], t_i)
 
+    def test_read_only_transaction_commits_despite_concurrent_change_of_read_object(
+        self,
+    ):
+        """A read-only TA always commits, even if another TA committed a change to an object it read.
+
+        t_i                                 t_j
+        begin
+                                            begin
+        read a==42 -> sees A=(42, 0)
+                                            update A to (7, 0)
+                                            commit
+        read a==42 -> still sees A=(42, 0)
+        commit -> succeeds
+
+        t_i writes nothing, so it is validated against its own snapshot, in which nothing changed. The same schedule
+        with a write of t_i aborts, see test_validation_detects_lost_update_on_read_object. Checked for both
+        validation methods.
+        """
+        for use_brute_force_validation in [True, False]:
+            with self.subTest(use_brute_force_validation=use_brute_force_validation):
+                tkvs: TransactionalKeyValueStore = TransactionalKeyValueStore(
+                    use_brute_force_validation=use_brute_force_validation
+                )
+                tkvs.put("A", StoreTestAnomalies.Stuff(42, 0))
+
+                t_i: int = tkvs.begin_transaction()
+                t_j: int = tkvs.begin_transaction()
+
+                # t_i reads A:
+                result: list[tuple[str, object]] = tkvs.read_objects(
+                    t_i, WHERE_Clause("a", "==", 42)
+                )
+                self.assertEqual(result, [("A", StoreTestAnomalies.Stuff(42, 0))])
+
+                # t_j changes A, so that it no longer matches t_i's read, and commits:
+                tkvs.update_object("A", StoreTestAnomalies.Stuff(7, 0), t_j)
+                tkvs.commit_transaction(t_j)
+
+                # snapshot isolation: t_i still sees the old version of A:
+                result_reread: list[tuple[str, object]] = tkvs.read_objects(
+                    t_i, WHERE_Clause("a", "==", 42)
+                )
+                self.assertEqual(result_reread, result)
+
+                # t_i wrote nothing, so it must commit:
+                tkvs.commit_transaction(t_i)
+                self.assertEqual(tkvs.committed_transactions_trace[-1], t_i)
+
     def test_validation_detects_write_skew_on_objects_with_equal_hash(self):
         """A TA aborts if a concurrent TA changed an object it read, even if both versions have the same Python hash.
 
