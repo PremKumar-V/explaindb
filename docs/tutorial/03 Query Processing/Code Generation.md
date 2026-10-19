@@ -16,8 +16,9 @@ modern compiling query engines (the "produce/consume" model).
   code; you can read the emitted program and compare it to the interpreted pipeline.
 - **Implementation:** the `compile(...)`/emit methods on the operators in
   [`system/query_processing/operators.py`](../../../system/query_processing/operators.py).
-- **Tests:** [`system/tests/test_code_gen.py`](../../../system/tests/test_code_gen.py) — a differential
-  test that asserts the interpreted and the compiled query return the same result.
+- **Tests:**
+  [`system/tests/query_processing/test_code_gen.py`](../../../system/tests/query_processing/test_code_gen.py) —
+  a differential test that asserts the interpreted and the compiled query return the same result.
 
 ## The idea in one picture
 

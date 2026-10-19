@@ -44,7 +44,7 @@ from pathlib import Path
 from types import ModuleType
 
 # Anchored to this test file so discovery works regardless of the caller's cwd.
-REPO_ROOT: Path = Path(__file__).resolve().parents[2]
+REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 ASSIGN_PATH: Path = REPO_ROOT / ".ci" / "assign_notebooks.py"
 NOTEBOOKS_DIR: Path = REPO_ROOT / "notebooks"
 

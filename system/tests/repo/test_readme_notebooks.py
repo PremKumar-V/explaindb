@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 # Anchored to this test file so discovery works regardless of the caller's cwd.
-REPO_ROOT: Path = Path(__file__).resolve().parents[2]
+REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 README_PATH: Path = REPO_ROOT / "README.md"
 NOTEBOOKS_DIR: Path = REPO_ROOT / "notebooks"
 

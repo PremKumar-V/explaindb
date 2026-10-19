@@ -305,7 +305,7 @@ class PaletteTest(unittest.TestCase):
 
 
 # the notebook that shows the playground:
-NOTEBOOK: Path = Path(__file__).parents[2] / "notebooks" / "MVCC-Playground.ipynb"
+NOTEBOOK: Path = Path(__file__).parents[3] / "notebooks" / "MVCC-Playground.ipynb"
 
 
 class NotebookTest(unittest.TestCase):

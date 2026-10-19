@@ -18,7 +18,7 @@ layer caches individual sub-units of the pages held below it.
   addressing.
 - **Interface:** [`system/interfaces/stores.py`](../../../system/interfaces/stores.py) and the key/value
   contract in [`system/interfaces/indexing/Index.py`](../../../system/interfaces/indexing/Index.py).
-- **Tests:** [`system/tests/test_storage.py`](../../../system/tests/test_storage.py) — including the
+- **Tests:** [`system/tests/storage/test_storage.py`](../../../system/tests/storage/test_storage.py) — including the
   prefix-addressing and eviction behaviour.
 
 ## The idea in one picture

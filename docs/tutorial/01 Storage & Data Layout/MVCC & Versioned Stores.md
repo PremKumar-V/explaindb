@@ -17,8 +17,8 @@ isolation and detects the anomalies a weaker scheme would allow.
   versioned base), [`system/stores/MVCC.py`](../../../system/stores/MVCC.py) (the MVCC store), and
   [`system/stores/IndexedMVCC.py`](../../../system/stores/IndexedMVCC.py) (an indexed variant).
 - **Interface:** [`system/interfaces/stores.py`](../../../system/interfaces/stores.py).
-- **Tests:** [`system/tests/test_stores_basics.py`](../../../system/tests/test_stores_basics.py) and
-  [`system/tests/test_store_anomalies.py`](../../../system/tests/test_store_anomalies.py) — the latter
+- **Tests:** [`system/tests/stores/test_stores_basics.py`](../../../system/tests/stores/test_stores_basics.py) and
+  [`system/tests/stores/test_store_anomalies.py`](../../../system/tests/stores/test_store_anomalies.py) — the latter
   drives concurrency anomalies (dirty read, lost update, …) and checks how the store handles them.
 - **Notebook:** [`MVCC-Playground.ipynb`](../../../notebooks/MVCC-Playground.ipynb) — build schedules by
   clicking and run them on the MVCC store, operation by operation.

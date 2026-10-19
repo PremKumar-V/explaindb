@@ -21,7 +21,7 @@
 """Scenarios for the MVCC playground: classic schedules that show how the store prevents (or allows) anomalies.
 
 The anomaly names lost update, write skew, phantom insert and concurrent delete follow the tests in
-``system/tests/test_store_anomalies.py``.
+``system/tests/stores/test_store_anomalies.py``.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ def make_scenario(
 
 
 # the scenarios, each with the objects it starts from and its schedule; how each one ends in each mode is pinned in
-# system/tests/test_mvcc_playground.py:
+# system/tests/playground/test_mvcc_playground.py:
 SCENARIOS: tuple[Scenario, ...] = (
     make_scenario(
         "serial",

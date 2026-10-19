@@ -22,7 +22,7 @@ stages:
 # them. A job that needs its own `rules` cannot use this template (its rules
 # would replace the template's); it starts its rules with the `schedule ...
 # when: never` rule instead, as `docs_build` and `pages` do.
-# system/tests/test_ci_config.py fails for a job that does neither.
+# system/tests/repo/test_ci_config.py fails for a job that does neither.
 .not_in_scheduled_pipelines:
   rules:
     - if: $CI_PIPELINE_SOURCE == 'schedule'
@@ -54,7 +54,7 @@ stages:
 # conservative: it only skips when *every* changed file is Markdown, and it never
 # skips on the default branch -- anything else leaves DOCS_ONLY=false. The
 # top-level README.md does not count as docs-only: a unit test
-# (system/tests/test_readme_notebooks.py) checks its notebook table.
+# (system/tests/repo/test_readme_notebooks.py) checks its notebook table.
 detect-docs-only:
   stage: prepare
   extends: .not_in_scheduled_pipelines
@@ -268,7 +268,7 @@ gitleaks_secret_detection:
   rules:
     # A scheduled pipeline never matches the merge-request rule below, so this
     # rule changes nothing; it keeps the rules of all jobs alike (see
-    # .not_in_scheduled_pipelines), and system/tests/test_ci_config.py requires
+    # .not_in_scheduled_pipelines), and system/tests/repo/test_ci_config.py requires
     # it:
     - if: $CI_PIPELINE_SOURCE == 'schedule'
       when: never
@@ -427,7 +427,7 @@ semgrep_sast:
   rules:
     # A scheduled pipeline never matches the merge-request rule below, so this
     # rule changes nothing; it keeps the rules of all jobs alike (see
-    # .not_in_scheduled_pipelines), and system/tests/test_ci_config.py requires
+    # .not_in_scheduled_pipelines), and system/tests/repo/test_ci_config.py requires
     # it:
     - if: $CI_PIPELINE_SOURCE == 'schedule'
       when: never
@@ -468,7 +468,7 @@ py_test:
 
 
 # Runs the larger schedule spaces of the serializability test of the MVCC store
-# (system/tests/test_mvcc_serializability.py, NightlySerializabilityTest: three
+# (system/tests/stores/test_mvcc_serializability.py, NightlySerializabilityTest: three
 # transactions, voluntary aborts, longer transactions) and the two-transaction
 # validation tests under further hash seeds. This takes about two hours and is
 # too slow for every merge request. It runs in the nightly scheduled pipeline on
@@ -495,7 +495,7 @@ serializability_nightly:
     # status of the tests is written to a file instead; `|| status=$?` keeps a
     # failing test run from ending the job before the status is written.
     - |
-      { status=0; uv run python -m unittest -v system.tests.test_mvcc_serializability.NightlySerializabilityTest || status=$?; echo "$status" > nightly.status; } 2>&1 | tee nightly.log
+      { status=0; uv run python -m unittest -v system.tests.stores.test_mvcc_serializability.NightlySerializabilityTest || status=$?; echo "$status" > nightly.status; } 2>&1 | tee nightly.log
       if [ "$(cat nightly.status)" != "0" ]; then exit 1; fi
       # unittest ends with "Ran N tests in ..." and, if tests were skipped,
       # "(skipped=M)"; fail if every test was skipped:
@@ -508,8 +508,8 @@ serializability_nightly:
     - |
       for seed in 1 2 3; do
         PYTHONHASHSEED=$seed uv run python -m unittest \
-          system.tests.test_mvcc_serializability.SerializabilityTest.test_validation_method_1_brute_force \
-          system.tests.test_mvcc_serializability.SerializabilityTest.test_validation_method_2_write_sets || exit 1
+          system.tests.stores.test_mvcc_serializability.SerializabilityTest.test_validation_method_1_brute_force \
+          system.tests.stores.test_mvcc_serializability.SerializabilityTest.test_validation_method_2_write_sets || exit 1
       done
   interruptible: true
 
@@ -584,7 +584,7 @@ docs_build:
   rules:
     # A scheduled pipeline never matches the merge-request rule below, so this
     # rule changes nothing; it keeps the rules of all jobs alike (see
-    # .not_in_scheduled_pipelines), and system/tests/test_ci_config.py requires
+    # .not_in_scheduled_pipelines), and system/tests/repo/test_ci_config.py requires
     # it:
     - if: $CI_PIPELINE_SOURCE == 'schedule'
       when: never
